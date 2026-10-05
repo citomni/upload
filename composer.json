@@ -1,0 +1,81 @@
+{
+    "name": "citomni/upload",
+    "description": "File intake and storage for CitOmni apps: validated uploads, local public/private storage, and image outputs delegated to citomni/image.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": [
+        "citomni",
+        "php",
+        "upload",
+        "file-upload",
+        "uploads",
+        "files",
+        "file-storage",
+        "local-storage",
+        "image-upload",
+        "thumbnails",
+        "mime-validation",
+        "file-validation",
+        "high-performance",
+        "low-overhead"
+    ],
+    "homepage": "https://github.com/citomni/upload",
+    "support": {
+        "email": "lars@grove-mortensen.dk",
+        "issues": "https://github.com/citomni/upload/issues",
+        "source": "https://github.com/citomni/upload",
+        "docs": "https://github.com/citomni/upload/blob/main/README.md",
+        "security": "https://github.com/citomni/.github/blob/main/SECURITY.md"
+    },
+    "require": {
+        "php": "^8.5",
+        "ext-fileinfo": "*",
+        "ext-mbstring": "*",
+        "citomni/kernel": "^1.0.2.2",
+        "citomni/image": "^1.0"
+    },
+    "suggest": {
+        "citomni/infrastructure": "Provides the log and txt services. Upload logs best-effort cleanup failures and translates rejection messages when they are registered."
+    },
+    "autoload": {
+        "psr-4": {
+            "CitOmni\\Upload\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "CitOmni\\Upload\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": [
+            "@php tests/util_test.php",
+            "@php tests/profile_test.php",
+            "@php tests/intake_test.php",
+            "@php tests/storage_test.php",
+            "@php tests/image_path_test.php",
+            "@php tests/image_integration_test.php",
+            "@php tests/delete_test.php",
+            "@php tests/read_path_test.php",
+            "@php tests/http_upload_test.php"
+        ]
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true,
+    "extra": {
+        "branch-alias": {
+            "dev-main": "1.0.x-dev"
+        }
+    },
+    "authors": [
+        {
+            "name": "Lars Grove Mortensen",
+            "email": "lars@grove-mortensen.dk",
+            "homepage": "https://www.citomni.com",
+            "role": "Developer"
+        }
+    ]
+}
