@@ -48,6 +48,9 @@ use CitOmni\Upload\Util\StoragePath;
  *   profile, collects rejections instead of stopping, and leaves the batch
  *   policy to the caller. It is optional: storeUpload() remains the building
  *   block for a caller with its own batch flow.
+ * - Checks: checkUpload() runs storeUpload()'s intake and validation without
+ *   writing anything, for a caller that stores the bytes through a storage
+ *   protocol of its own. The upload stays where PHP put it.
  * - Generic validation runs before anything is written. Size is measured by
  *   Upload (empty files and max_bytes), and the MIME type is detected by finfo,
  *   canonicalized, and matched exactly against the profile's accept list.
@@ -209,27 +212,80 @@ final class Upload extends BaseService {
 	public function storeUpload(array $file, string|array $profile, string $subdir = ''): array {
 		$resolved = $this->resolveProfile($profile);
 		StoragePath::validateRelative($subdir);
-
-		$name = $file['name'] ?? null;
-		$tmpName = $file['tmp_name'] ?? null;
-		$error = $file['error'] ?? null;
-
-		if (!\is_string($name) || !\is_string($tmpName) || !\is_int($error)) {
-			throw new \InvalidArgumentException('storeUpload() expects one file entry with a string name, a string tmp_name, and an int error; obtain it with UploadedFiles::one() or UploadedFiles::many().');
-		}
+		[$tmpName, $originalName, $error] = self::uploadEntry($file, 'storeUpload');
 
 		// Storage configuration fails fast, before any user-side upload error is reported.
 		$this->storageRoot($resolved['storage']);
 		$this->modes();
 
-		$originalName = OriginalName::sanitize($name);
-		$this->mapUploadError($error, $originalName);
-
-		if (!\is_uploaded_file($tmpName)) {
-			throw new \InvalidArgumentException('Not a file uploaded in the current request: ' . $tmpName . '. Use storeLocal() for local files.');
-		}
+		$this->requireUpload($tmpName, $error, $originalName);
 
 		return $this->ingest($tmpName, $resolved, $subdir, $originalName, true);
+	}
+
+
+	/**
+	 * Validate a file uploaded in the current HTTP request without storing it.
+	 *
+	 * Runs the intake and validation of storeUpload() for a caller that stores
+	 * the bytes through a storage protocol of its own, for example one that
+	 * records an intent before any byte is written. The caller reads
+	 * $file['tmp_name'] after a successful check.
+	 *
+	 * Behavior:
+	 * - Resolves the profile and validates the shape of $file first, so
+	 *   developer and configuration errors are reported before any user-side
+	 *   outcome, as in storeUpload().
+	 * - Maps PHP's upload error code and requires is_uploaded_file() without
+	 *   fallback, as storeUpload() does.
+	 * - Runs the generic validation: empty files, max_bytes, and the canonical
+	 *   finfo type against the profile's accept list. An image profile receiving
+	 *   a citomni/image format is inspected, and citomni/image's type must equal
+	 *   finfo's, as on the store path.
+	 * - Writes, moves, and removes nothing. The storage root, file_mode, and
+	 *   dir_mode are not checked, because nothing is placed in storage. The
+	 *   upload stays where PHP put it, so a checked entry can still be read,
+	 *   copied, or stored within the request; PHP deletes it when the request
+	 *   ends.
+	 *
+	 * Notes:
+	 * - The profile is the same policy object storeUpload() uses. Its directory,
+	 *   shard, hash, and image outputs are validated with it but have no effect
+	 *   on a check.
+	 * - For an image profile, a passed check is not proof that storeUpload()
+	 *   succeeds: inspection reads headers, while the image job decodes pixels.
+	 * - width and height are the display dimensions that inspection reports, or
+	 *   null when the file takes the plain path.
+	 * - Exceptions from citomni/image other than ImageInputException, such as a
+	 *   configuration error raised by the image service's init(), propagate
+	 *   unchanged.
+	 *
+	 * Typical usage:
+	 *   $checked = $this->app->upload->checkUpload($file, 'invoice_intake');
+	 *   $stream = \fopen($file['tmp_name'], 'rb');
+	 *
+	 * @param array<string, mixed> $file Entry from UploadedFiles::one() or UploadedFiles::many(); string name, string tmp_name, and int error are required.
+	 * @param string|array<string, mixed> $profile Profile name in upload.profiles, or an inline profile array.
+	 * @return array{mime: string, size: int, original_name: string, width: int|null, height: int|null} Canonical detected type, measured size, sanitized client name, and display dimensions of an inspected image.
+	 * @throws UploadRejectedException When PHP reports a client-side upload error, or the file is empty, too large, of a type the profile does not accept, or an image that citomni/image rejects or detects as another type.
+	 * @throws UploadConfigException When the profile is invalid.
+	 * @throws UploadStorageException When PHP reports a server-side upload error, or the size or type of the upload cannot be read.
+	 * @throws \InvalidArgumentException When $file is invalid, or the file was not uploaded in the current request.
+	 */
+	public function checkUpload(array $file, string|array $profile): array {
+		$resolved = $this->resolveProfile($profile);
+		[$tmpName, $originalName, $error] = self::uploadEntry($file, 'checkUpload');
+
+		$this->requireUpload($tmpName, $error, $originalName);
+		$examined = $this->examine($tmpName, $resolved, $originalName);
+
+		return [
+			'mime' => $examined['mime'],
+			'size' => $examined['size'],
+			'original_name' => $originalName,
+			'width' => $examined['info']['display_width'] ?? null,
+			'height' => $examined['info']['display_height'] ?? null,
+		];
 	}
 
 
@@ -1203,6 +1259,47 @@ final class Upload extends BaseService {
 
 
 	/**
+	 * Read the fields of one upload entry that Upload checks.
+	 *
+	 * @param array<string, mixed> $file Upload entry.
+	 * @param string $method Public method name, for the message.
+	 * @return array{0: string, 1: string, 2: int} tmp_name, sanitized original name, and the UPLOAD_ERR_* code.
+	 * @throws \InvalidArgumentException When name or tmp_name is not a string, or error is not an int.
+	 */
+	private static function uploadEntry(array $file, string $method): array {
+		$name = $file['name'] ?? null;
+		$tmpName = $file['tmp_name'] ?? null;
+		$error = $file['error'] ?? null;
+
+		if (!\is_string($name) || !\is_string($tmpName) || !\is_int($error)) {
+			throw new \InvalidArgumentException($method . '() expects one file entry with a string name, a string tmp_name, and an int error; obtain it with UploadedFiles::one() or UploadedFiles::many().');
+		}
+
+		return [$tmpName, OriginalName::sanitize($name), $error];
+	}
+
+
+	/**
+	 * Map the upload error code, then require that the file was uploaded in the current request.
+	 *
+	 * @param string $tmpName PHP's temporary file name.
+	 * @param int $error UPLOAD_ERR_* code of the file entry.
+	 * @param string $originalName Sanitized original name, for the rejection context.
+	 * @return void
+	 * @throws UploadRejectedException For client-side upload errors.
+	 * @throws UploadStorageException For server-side upload errors.
+	 * @throws \InvalidArgumentException When the file was not uploaded in the current request.
+	 */
+	private function requireUpload(string $tmpName, int $error, string $originalName): void {
+		$this->mapUploadError($error, $originalName);
+
+		if (!\is_uploaded_file($tmpName)) {
+			throw new \InvalidArgumentException('Not a file uploaded in the current request: ' . $tmpName . '. Use storeLocal() for local files.');
+		}
+	}
+
+
+	/**
 	 * Run the intake pipeline for a source that passed the entry checks.
 	 *
 	 * @param string $source Readable regular file, or the file uploaded in the current request.
@@ -1221,40 +1318,13 @@ final class Upload extends BaseService {
 		$root = $this->storageRoot($profile['storage']);
 		[$fileMode, $dirMode] = $this->modes();
 
-		// -- 2. Generic validation ----------------------------------------
-		// Size and type are measured here; client-reported values are never used.
+		// -- 2. Validation and route --------------------------------------
+		// See examine(): nothing is written before it returns.
 
-		$size = @\filesize($source);
-
-		if ($size === false) {
-			throw new UploadStorageException('Failed to read the size of ' . $source . '.');
-		}
-
-		if ($size === 0) {
-			throw new UploadRejectedException(UploadRejection::Empty, ['original_name' => $originalName, 'size' => 0]);
-		}
-
-		if ($profile['max_bytes'] !== null && $size > $profile['max_bytes']) {
-			throw new UploadRejectedException(UploadRejection::TooLarge, ['original_name' => $originalName, 'size' => $size, 'max_bytes' => $profile['max_bytes']]);
-		}
-
-		$mime = MimeMap::canonical($this->detectMime($source));
-
-		if ($profile['accept'] !== null && !isset($profile['accept'][$mime])) {
-			throw new UploadRejectedException(UploadRejection::TypeNotAllowed, ['original_name' => $originalName, 'size' => $size, 'mime' => $mime]);
-		}
-
-		// -- 3. Route -----------------------------------------------------
-		// Future seam: content scanning would go here, after validation and before any write.
-		// An image profile hands an image type to citomni/image; everything else, including a
-		// PDF in an image profile, is a plain file. inspect() runs before anything is written.
-
-		$context = ['original_name' => $originalName, 'size' => $size, 'mime' => $mime];
-		$image = $profile['image'] !== null && MimeMap::imageFormat($mime) !== null ? $profile['image'] : null;
-		$info = $image !== null ? $this->inspectImage($source, $mime, $context) : null;
+		['size' => $size, 'mime' => $mime, 'context' => $context, 'image' => $image, 'info' => $info] = $this->examine($source, $profile, $originalName);
 		$produced = $image !== null && $image['main'] !== null;
 
-		// -- 4. Write with compensation -----------------------------------
+		// -- 3. Write with compensation -----------------------------------
 
 		$name = \bin2hex(\random_bytes(16));
 		$shards = [];
@@ -1330,6 +1400,67 @@ final class Upload extends BaseService {
 				$this->discard($written, $profile['storage']);
 			}
 		}
+	}
+
+
+	/**
+	 * Validate a source and decide its route, without writing anything.
+	 *
+	 * Behavior:
+	 * - Measures the size: an empty file and a file above max_bytes are
+	 *   rejected.
+	 * - Detects the MIME type with finfo, canonicalizes it, and matches it
+	 *   exactly against the profile's accept list.
+	 * - Routes an image profile receiving a citomni/image format to the image
+	 *   path, where citomni/image inspects the source and must report the same
+	 *   type. Everything else, including a PDF in an image profile, is a plain
+	 *   file and touches no image service.
+	 *
+	 * Notes:
+	 * - Shared by ingest() and checkUpload(), so a check and a store accept and
+	 *   reject the same files at this stage.
+	 *
+	 * @param string $source Readable regular file, or the file uploaded in the current request.
+	 * @param array<string, mixed> $profile Normalized profile.
+	 * @param string $originalName Sanitized original name.
+	 * @return array{size: int, mime: string, context: array<string, mixed>, image: array<string, mixed>|null, info: array<string, mixed>|null} Measured size, canonical type, rejection context, the image block when the image path applies, and the inspect() result.
+	 * @throws UploadRejectedException When generic validation or inspection rejects the file.
+	 * @throws UploadStorageException When the size or the type cannot be read.
+	 */
+	private function examine(string $source, array $profile, string $originalName): array {
+		// -- 1. Generic validation ----------------------------------------
+		// Size and type are measured here; client-reported values are never used.
+
+		$size = @\filesize($source);
+
+		if ($size === false) {
+			throw new UploadStorageException('Failed to read the size of ' . $source . '.');
+		}
+
+		if ($size === 0) {
+			throw new UploadRejectedException(UploadRejection::Empty, ['original_name' => $originalName, 'size' => 0]);
+		}
+
+		if ($profile['max_bytes'] !== null && $size > $profile['max_bytes']) {
+			throw new UploadRejectedException(UploadRejection::TooLarge, ['original_name' => $originalName, 'size' => $size, 'max_bytes' => $profile['max_bytes']]);
+		}
+
+		$mime = MimeMap::canonical($this->detectMime($source));
+
+		if ($profile['accept'] !== null && !isset($profile['accept'][$mime])) {
+			throw new UploadRejectedException(UploadRejection::TypeNotAllowed, ['original_name' => $originalName, 'size' => $size, 'mime' => $mime]);
+		}
+
+		// -- 2. Route -----------------------------------------------------
+		// Future seam: content scanning would go here, after validation and before any write.
+		// An image profile hands an image type to citomni/image; everything else, including a
+		// PDF in an image profile, is a plain file. inspect() runs before anything is written.
+
+		$context = ['original_name' => $originalName, 'size' => $size, 'mime' => $mime];
+		$image = $profile['image'] !== null && MimeMap::imageFormat($mime) !== null ? $profile['image'] : null;
+		$info = $image !== null ? $this->inspectImage($source, $mime, $context) : null;
+
+		return ['size' => $size, 'mime' => $mime, 'context' => $context, 'image' => $image, 'info' => $info];
 	}
 
 

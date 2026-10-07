@@ -323,8 +323,8 @@ return [
 				"\t\t\$root = \$this->storageRoot(\$profile['storage']);\n\t\t\$modesLater = true;\n",
 			],
 			[
-				"\t\t// -- 3. Route -----------------------------------------------------\n",
-				"\t\t// -- 3. Route -----------------------------------------------------\n\t\t[\$fileMode, \$dirMode] = \$this->modes();\n",
+				"\t\t\$produced = \$image !== null && \$image['main'] !== null;\n",
+				"\t\t\$produced = \$image !== null && \$image['main'] !== null;\n\t\t[\$fileMode, \$dirMode] = \$this->modes();\n",
 			],
 		],
 		'tests' => ['util', 'profile', 'storage'],
@@ -486,6 +486,58 @@ return [
 			],
 		],
 		'tests' => ['intake', 'http_upload', 'storage'],
+	],
+
+	[
+		'id' => 'intake-13',
+		'label' => 'checkUpload() requires a provisioned storage root',
+		'file' => 'src/Service/Upload.php',
+		'edits' => [
+			[
+				"\t\t[\$tmpName, \$originalName, \$error] = self::uploadEntry(\$file, 'checkUpload');\n",
+				"\t\t[\$tmpName, \$originalName, \$error] = self::uploadEntry(\$file, 'checkUpload');\n\t\t\$this->storageRoot(\$resolved['storage']);\n",
+			],
+		],
+		'tests' => ['intake', 'http_upload'],
+	],
+
+	[
+		'id' => 'intake-14',
+		'label' => 'checkUpload() consumes the upload',
+		'file' => 'src/Service/Upload.php',
+		'edits' => [
+			[
+				"\t\t\$examined = \$this->examine(\$tmpName, \$resolved, \$originalName);\n",
+				"\t\t\$examined = \$this->examine(\$tmpName, \$resolved, \$originalName);\n\t\t@\\unlink(\$tmpName);\n",
+			],
+		],
+		'tests' => ['intake', 'http_upload'],
+	],
+
+	[
+		'id' => 'intake-15',
+		'label' => 'checkUpload() reports the client type',
+		'file' => 'src/Service/Upload.php',
+		'edits' => [
+			[
+				"\t\t\t'mime' => \$examined['mime'],\n",
+				"\t\t\t'mime' => (string)(\$file['type'] ?? ''),\n",
+			],
+		],
+		'tests' => ['intake', 'http_upload'],
+	],
+
+	[
+		'id' => 'intake-16',
+		'label' => 'checkUpload() skips the generic validation',
+		'file' => 'src/Service/Upload.php',
+		'edits' => [
+			[
+				"\t\t\$examined = \$this->examine(\$tmpName, \$resolved, \$originalName);\n",
+				"\t\t\$examined = ['mime' => 'application/pdf', 'size' => (int)@\\filesize(\$tmpName), 'info' => null];\n",
+			],
+		],
+		'tests' => ['intake', 'http_upload'],
 	],
 
 	// -- Batches: storeUploads() and cleanupStored() ----------------------------------

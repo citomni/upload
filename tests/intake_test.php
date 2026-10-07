@@ -19,10 +19,11 @@ declare(strict_types=1);
  * $path, full_path, empty slots) and of malformed or shape-confused entries;
  * storeUpload() up to and including its provenance check (developer and
  * configuration errors first, every UPLOAD_ERR_* code, no fallback for files
- * that were not uploaded); storeUploads() in the same scope (the same checks
- * first, also for an empty list, collected rejections, faults that propagate,
- * and #[\NoDiscard]); rejectionMessage() in both forms, with and without the
- * txt service; and the shipped language files.
+ * that were not uploaded); checkUpload() in the same scope, without the
+ * storage preconditions it never needs; storeUploads() in the same scope (the
+ * same checks first, also for an empty list, collected rejections, faults that
+ * propagate, and #[\NoDiscard]); rejectionMessage() in both forms, with and
+ * without the txt service; and the shipped language files.
  *
  * is_uploaded_file() is false outside an HTTP upload, so everything past the
  * provenance check is covered by http_upload_test.php.
@@ -239,6 +240,40 @@ expectThrows(\InvalidArgumentException::class, static fn() => $upload->storeUplo
 
 check(\scandir($root) === ['.', '..'], 'storeUpload() wrote nothing outside an HTTP upload');
 check(!\in_array('image', $app->touched, true) && !\in_array('txt', $app->touched, true), 'storeUpload() resolves neither image nor txt');
+
+// -- checkUpload(): the intake of storeUpload(), without storage ----------------------------
+
+expectThrows(UploadConfigException::class, static fn() => $upload->checkUpload($entry(\UPLOAD_ERR_NO_FILE), ['storage' => 'nowhere'] + $profile), 'checkUpload(): an invalid profile is reported before the upload error');
+expectThrows(UploadConfigException::class, static fn() => $upload->checkUpload([], 'undefined'), 'checkUpload(): an undefined profile is reported before the shape of $file');
+
+foreach ($badFiles as $why => $file) {
+	$e = expectThrows(\InvalidArgumentException::class, static fn() => $upload->checkUpload($file, $profile), "checkUpload(): a \$file with {$why} is a developer error");
+	check(\str_contains($e->getMessage(), 'checkUpload() expects one file entry'), "checkUpload(): the message for a \$file with {$why} names checkUpload()");
+}
+
+$e = expectThrows(\InvalidArgumentException::class, static fn() => $upload->checkUpload($manipulated, $profile), 'checkUpload(): a raw entry that the client sent as name[] is a developer error');
+check(\str_contains($e->getMessage(), 'UploadedFiles::one()'), 'checkUpload(): the message points to UploadedFiles::one()');
+
+foreach ($rejections as $error => [$reason, $context]) {
+	$e = expectThrows(UploadRejectedException::class, static fn() => $upload->checkUpload($entry($error), $profile), "checkUpload(): upload error {$error} is a rejection");
+	check($e->reason === $reason && $e->context === $context, "checkUpload(): upload error {$error} maps to {$reason->name}, as in storeUpload()");
+}
+
+foreach ($faults as $error => $label) {
+	$e = expectThrows(UploadStorageException::class, static fn() => $upload->checkUpload($entry($error), $profile), "checkUpload(): upload error {$error} is a server fault");
+	check(\str_contains($e->getMessage(), "upload error {$error} ({$label})"), "checkUpload(): the message names upload error {$error} as {$label}");
+}
+
+$e = expectThrows(UploadRejectedException::class, static fn() => $upload->checkUpload($entry(\UPLOAD_ERR_PARTIAL), ['storage' => 'gone'] + $profile), 'checkUpload() with an unprovisioned storage root');
+check($e->reason === UploadRejection::Partial, 'checkUpload() checks no storage root, because it places nothing in storage');
+$e = expectThrows(UploadRejectedException::class, static fn() => $badModes->checkUpload($entry(\UPLOAD_ERR_PARTIAL), $profile), 'checkUpload() with an invalid file_mode');
+check($e->reason === UploadRejection::Partial, 'checkUpload() checks no modes, because it places nothing in storage');
+
+$e = expectThrows(\InvalidArgumentException::class, static fn() => $upload->checkUpload($entry(\UPLOAD_ERR_OK, $local, 'local.pdf'), $profile), 'checkUpload(): a local file is not an upload');
+check(\str_contains($e->getMessage(), 'Not a file uploaded in the current request') && \file_get_contents($local) === Fixtures::pdf(), 'checkUpload(): there is no fallback for local files, and the file is untouched');
+
+check(\scandir($root) === ['.', '..'], 'checkUpload() wrote nothing');
+check(!\in_array('image', $app->touched, true) && !\in_array('txt', $app->touched, true), 'checkUpload() resolves neither image nor txt');
 
 // -- storeUploads(): the same checks first, rejections collected ----------------------------
 

@@ -14,15 +14,16 @@ declare(strict_types=1);
  */
 
 /*
- * End-to-end checks for storeUpload() and storeUploads() with real HTTP uploads.
+ * End-to-end checks for checkUpload(), storeUpload(), and storeUploads() with
+ * real HTTP uploads.
  *
  * is_uploaded_file() and move_uploaded_file() only accept files uploaded in
  * the current request. This script therefore starts PHP's built-in web server
  * on 127.0.0.1 and a free port, sends raw multipart/form-data requests, and
- * lets tests/Support/http_router.php call UploadedFiles, storeUpload(),
- * storeUploads(), and cleanupStored() inside each request. The router reports
- * results, exceptions, and the state of the uploaded files as JSON; this
- * script inspects storage directly.
+ * lets tests/Support/http_router.php call UploadedFiles, checkUpload(),
+ * storeUpload(), storeUploads(), and cleanupStored() inside each request. The
+ * router reports results, exceptions, and the state of the uploaded files as
+ * JSON; this script inspects storage directly.
  *
  * The server is stopped in finally, so a failed check never leaves it running.
  * The script skips itself outside the CLI, without proc_open(), or when the
@@ -32,6 +33,7 @@ declare(strict_types=1);
 require __DIR__ . '/bootstrap.php';
 
 use CitOmni\Image\Boot\Registry as ImageRegistry;
+use CitOmni\Image\Enum\ImageFormat;
 use CitOmni\Image\Exception\ImageCapabilityException;
 use CitOmni\Image\Service\Image;
 use CitOmni\Upload\Exception\UploadRejectedException;
@@ -278,6 +280,65 @@ try {
 	} else {
 		skip('image upload with the real citomni/image', 'ext-gd with JPEG decoding and WebP encoding is not available');
 	}
+
+	// -- Checking an upload without storing it: checkUpload() ---------------------------------
+
+	$root = $newRoot();
+	$report = $request(['root' => $root, 'checks' => [['entry' => 'one', 'field' => 'f', 'profile' => $pdfProfile]]], [['f', "Faktura\u{202E}fdp.pdf", $pdf]]);
+	$checked = $report['checks'][0];
+	check(
+		($checked['result'] ?? null) === ['mime' => 'application/pdf', 'size' => \strlen($pdf), 'original_name' => 'Fakturafdp.pdf', 'width' => null, 'height' => null],
+		'checkUpload() returns the detected type instead of the client type (application/octet-stream), the measured size, and the sanitized name'
+	);
+	check($checked['tmp_exists_after'] === true && $checked['tmp_sha256_after'] === \hash('sha256', $pdf), 'checkUpload() leaves the upload with PHP, byte for byte');
+	check(filesUnder($root) === [] && $report['log'] === [] && !\in_array('image', $report['touched'], true) && !\in_array('txt', $report['touched'], true), 'checkUpload() writes nothing, logs nothing, and resolves neither image nor txt on the plain path');
+
+	$report = $request(['root' => $root, 'checks' => [['entry' => 'one', 'field' => 'f', 'profile' => $pdfProfile]], 'calls' => [['entry' => 'one', 'field' => 'f', 'profile' => $pdfProfile]]], [['f', 'x.pdf', $pdf]]);
+	$path = $report['calls'][0]['result']['path'] ?? '';
+	check(isset($report['checks'][0]['result']) && $path !== '' && filesUnder($root) === [$path] && \file_get_contents($root . '/' . $path) === $pdf, 'a checked upload can still be stored within the request');
+
+	$missing = $dir . '/not-provisioned';
+	$report = $request(['root' => $missing, 'upload' => ['file_mode' => '0644'], 'checks' => [['entry' => 'one', 'field' => 'f', 'profile' => $pdfProfile]]], [['f', 'x.pdf', $pdf]]);
+	check(($report['checks'][0]['result']['mime'] ?? null) === 'application/pdf' && !\file_exists($missing), 'checkUpload() needs neither a provisioned storage root nor a valid file_mode, and creates nothing');
+
+	$report = $request(['root' => $root, 'checks' => [
+		['entry' => 'one', 'field' => 'empty', 'profile' => $pdfProfile],
+		['entry' => 'one', 'field' => 'big', 'profile' => ['max_bytes' => 10] + $pdfProfile],
+		['entry' => 'one', 'field' => 'evil', 'profile' => $pdfProfile],
+		['entry' => 'one', 'field' => 'huge', 'profile' => $pdfProfile],
+		['entry' => 'raw', 'field' => 'none', 'profile' => $pdfProfile],
+	]], [['empty', 'empty.pdf', ''], ['big', 'big.pdf', $pdf], ['evil', 'evil.pdf', Fixtures::php()], ['huge', 'huge.pdf', \str_repeat('x', 2048)], ['none', '', '']]);
+	$errors = \array_column($report['checks'], 'error');
+	check(\array_column($errors, 'reason') === ['empty', 'too_large', 'type_not_allowed', 'too_large', 'no_file'], 'checkUpload() rejects as storeUpload() does: Empty, TooLarge (max_bytes), TypeNotAllowed, TooLarge (UPLOAD_ERR_INI_SIZE), and NoFile');
+	check(
+		$errors[1]['context'] === ['original_name' => 'big.pdf', 'size' => \strlen($pdf), 'max_bytes' => 10] && $errors[2]['context']['mime'] !== 'application/pdf'
+		&& $errors[3]['context'] === ['original_name' => 'huge.pdf', 'upload_error' => \UPLOAD_ERR_INI_SIZE],
+		'the rejections carry the same contexts as storeUpload()'
+	);
+	check(\array_column($report['checks'], 'tmp_exists_after') === [true, true, true, null, null] && filesUnder($root) === [$path], 'a rejected check leaves the upload with PHP and writes nothing');
+
+	$report = $request(['root' => $root, 'checks' => [[
+		'entry' => ['name' => 'local.pdf', 'type' => 'application/pdf', 'tmp_name' => $local, 'error' => \UPLOAD_ERR_OK, 'size' => \strlen($pdf)],
+		'profile' => $pdfProfile,
+	]]], [['f', 'other.txt', "x\n"]]);
+	check(($report['checks'][0]['error']['class'] ?? null) === \InvalidArgumentException::class && \file_get_contents($local) === $pdf, 'checkUpload() refuses a path that is not an upload of the request, and the file is untouched');
+
+	$images = ['storage' => 'files', 'accept' => ['image/jpeg', 'image/png'], 'max_bytes' => 1000, 'image' => ['main' => null, 'variants' => ['preview' => ['format' => 'webp', 'width' => 10]]]];
+	$png = Fixtures::header(ImageFormat::Png, 16, 8);
+	$report = $request(['root' => $root, 'image' => 'scripted', 'checks' => [
+		['entry' => 'one', 'field' => 'photo', 'profile' => $images],
+		['entry' => 'one', 'field' => 'mislabeled', 'profile' => $images],
+	]], [['photo', 'photo.jpg', Fixtures::jpeg()], ['mislabeled', 'graphic.png', $png]]);
+	[$photo, $mislabeled] = $report['checks'];
+	check(
+		($photo['result'] ?? null) === ['mime' => 'image/jpeg', 'size' => \strlen(Fixtures::jpeg()), 'original_name' => 'photo.jpg', 'width' => 1600, 'height' => 1200]
+		&& $photo['tmp_exists_after'] === true && filesUnder($root) === [$path],
+		'an image profile inspects the upload and reports the display size from inspection, without an image job'
+	);
+	check(
+		($mislabeled['error']['reason'] ?? null) === 'type_not_allowed' && ($mislabeled['error']['context']['image_mime'] ?? null) === 'image/jpeg',
+		'on the image path, finfo and citomni/image must agree, as on the store path'
+	);
 
 	// -- Batches: storeUploads() --------------------------------------------------------------
 

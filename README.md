@@ -17,7 +17,7 @@ Upload knows **when** an accepted file needs image processing, **which** outputs
 3. It stores the file under a fresh random name. For an image profile, `citomni/image` produces the image outputs at paths Upload chose.
 4. It returns a plain array with the storage-relative path and metadata.
 
-The application persists that array. Upload knows nothing about databases, users, or entities. For a multi-file field, `storeUploads()` runs the same steps for every file and returns the results together with the rejections.
+The application persists that array. Upload knows nothing about databases, users, or entities. For a multi-file field, `storeUploads()` runs the same steps for every file and returns the results together with the rejections. An application that stores the bytes through a protocol of its own calls `checkUpload()`: it validates the file as in step 2 and writes nothing.
 
 ---
 
@@ -326,6 +326,8 @@ final class Upload extends BaseService {
 	#[\NoDiscard]
 	public function storeUpload(array $file, string|array $profile, string $subdir = ''): array {}
 
+	public function checkUpload(array $file, string|array $profile): array {}
+
 	#[\NoDiscard]
 	public function storeUploads(array $files, string|array $profile, string $subdir = ''): array {}
 
@@ -366,7 +368,7 @@ MimeMap::extension(string $canonicalMime): string
 MimeMap::imageFormat(string $canonicalMime): ?ImageFormat
 ```
 
-- `storeUpload()`, `storeUploads()`, and `storeLocal()` carry `#[\NoDiscard]`, because a stored file whose path is never persisted is an orphan. `delete*()` and `cleanup*()` do not; callers deliberately ignore cleanup results.
+- `storeUpload()`, `storeUploads()`, and `storeLocal()` carry `#[\NoDiscard]`, because a stored file whose path is never persisted is an orphan. `checkUpload()` stores nothing and carries no attribute. Neither do `delete*()` and `cleanup*()`; callers deliberately ignore cleanup results.
 - The service does no work at construction. Named profiles, storage roots, web paths, modes, and the `finfo` instance are resolved lazily and memoized per service instance. `$this->app->image` is resolved only on the image path, because its initialization reads and validates `image.*`.
 - Deletion and the path methods are described under [Deleting files and deriving paths](#deleting-files-and-deriving-paths).
 
@@ -380,6 +382,39 @@ Stores a file uploaded in the current HTTP request.
 - The client's `type` and `size` are never used. Its `name` becomes sanitized metadata (`original_name`) and never part of a path.
 - When Upload stores the original itself (a plain file, or an image whose `main` is `null`), it moves the upload with `move_uploaded_file()`, and storing the same entry again throws `\InvalidArgumentException`. A re-encoded main leaves the upload with PHP, which deletes it when the request ends.
 - A rejection leaves the upload where PHP put it, so the same entry can be stored again within the request, for example with another profile. A failure after the move removes the moved data along with the call's other files; the client has to upload again.
+
+### `checkUpload()`
+
+Validates a file uploaded in the current HTTP request with the intake of `storeUpload()` and stores nothing. It serves an application that writes the bytes through a storage protocol of its own, for example one that records an intent in its database before any byte is written and keys its storage by that intent. Such an application cannot use Upload's storage, whose names are random and whose files exist before the application knows them, but it still needs Upload's intake policy in front of its own write.
+
+```php
+$file = UploadedFiles::one($_FILES['document'] ?? null);
+
+if ($file === null) {
+	$message = $this->app->upload->rejectionMessage(UploadRejection::NoFile);
+	// Render the form with $message (app-specific).
+	return;
+}
+
+try {
+	$checked = $this->app->upload->checkUpload($file, 'document_intake');
+} catch (UploadRejectedException $e) {
+	$message = $this->app->upload->rejectionMessage($e);
+	// Render the form with $message (app-specific).
+	return;
+}
+
+// ['mime' => 'application/pdf', 'size' => 184321, 'original_name' => 'Faktura 2026.pdf', 'width' => null, 'height' => null]
+$stream = \fopen($file['tmp_name'], 'rb');
+// Hand $stream and $checked to the application's own storage protocol (app-specific).
+```
+
+- The checks and their order are those of `storeUpload()`, except that nothing is placed in storage: the profile and the shape of `$file` first, then the PHP error code, provenance (`is_uploaded_file()` without fallback), the size, and the detected type against `accept`. The storage root, `file_mode`, and `dir_mode` are not checked.
+- On the image path, `citomni/image` inspects the upload and must report the same type as `finfo`, as on the store path. Inspection reads headers only, so a passed check is not proof that an image job succeeds.
+- The result has the keys `mime` (the canonical detected type), `size` (measured by Upload), `original_name` (sanitized), and `width` and `height` (the display dimensions from inspection, or `null` on the plain path). The client's `type` and `size` are never used.
+- Nothing is written, moved, or removed. The upload stays where PHP put it, so the caller can read it, and the same entry can still be stored within the request. PHP deletes it when the request ends.
+- The rejections are those of `storeUpload()`, with the same contexts. The other exceptions are those `storeUpload()` can raise before it writes: `UploadConfigException` for the profile, `UploadStorageException` for a server-side PHP upload error or a size or type that cannot be read, and `\InvalidArgumentException` for a malformed entry or a file that was not uploaded in the request. See [Errors and exceptions](#errors-and-exceptions).
+- The profile is validated like any profile, including its `storage`, but its storage, `directory`, `shard`, `hash`, and image outputs have no effect on a check.
 
 ### `storeUploads()`
 
@@ -509,7 +544,7 @@ Returns end-user text for a rejection. It takes the exception or its reason. The
 
 The Upload exceptions live in `CitOmni\Upload\Exception`.
 
-- Adapters catch `UploadRejectedException` and nothing else. Catching `UploadException` would hide configuration and server faults behind a validation message. `storeUploads()` returns its rejections instead of throwing them; everything else propagates as from `storeUpload()`.
+- Adapters catch `UploadRejectedException` and nothing else. Catching `UploadException` would hide configuration and server faults behind a validation message. `storeUploads()` returns its rejections instead of throwing them; everything else propagates as from `storeUpload()`. `checkUpload()` throws the rejections of `storeUpload()`.
 - Every other exception, including `\InvalidArgumentException` and `citomni/image`'s `ImageCapabilityException`, is a fault for the error handler.
 - `UploadConfigException` messages name the profile or the configuration key.
 - `UploadRejectedException` carries `public readonly UploadRejection $reason` and `public readonly array $context`. Its message (`Upload rejected: {reason}`) is meant for logs. A rejected call leaves no file in storage.
@@ -721,7 +756,7 @@ $src = $baseUrl . '/' . $this->app->upload->webPath('public', $thumb);
 
 ## Usage patterns
 
-The patterns are illustrative, like the Quick start. They share one order: store the new file, persist, then remove the old file. A crash can leave an orphaned file or a dot-prefixed `.tmp` file; that is harmless and is removed by an application job. A database reference to a deleted file must never arise.
+The patterns are illustrative, like the Quick start. The patterns that store through Upload share one order: store the new file, persist, then remove the old file. A crash can leave an orphaned file or a dot-prefixed `.tmp` file; that is harmless and is removed by an application job. A database reference to a deleted file must never arise.
 
 ### One file per entity
 
@@ -894,6 +929,41 @@ $this->app->upload->deleteWithVariants($row['storage_path'], 'archived_document'
 $repository->markPurged($row['id']);
 ```
 
+### Intake for an application-owned storage protocol
+
+Some applications must not let a file exist before their database knows it, for example records that have to be found after a crash without listing storage. They commit an intent first and write the bytes under a key derived from it. Upload's storage cannot serve them, because it names files itself, but `checkUpload()` applies the same intake policy in front of the application's own write:
+
+```php
+// Controller action body (illustrative), with the imports of the Quick start controller.
+$file = UploadedFiles::one($_FILES['document'] ?? null);
+
+if ($file === null) {
+	$message = $this->app->upload->rejectionMessage(UploadRejection::NoFile);
+	// Render the form with $message (app-specific).
+	return;
+}
+
+try {
+	$checked = $this->app->upload->checkUpload($file, 'document_intake');
+} catch (UploadRejectedException $e) {
+	$message = $this->app->upload->rejectionMessage($e);
+	// Render the form with $message (app-specific).
+	return;
+}
+
+$stream = \fopen($file['tmp_name'], 'rb');
+
+try {
+	// Commits the intent, then writes $stream under a key derived from it (app-specific).
+	$result = (new ReceiveDocument($this->app))->execute($ownerId, $checked['original_name'], $checked['mime'], $stream);
+} finally {
+	\fclose($stream);
+}
+```
+
+- A profile used only for checks still names a storage, which is validated but never written to; the baseline `private` storage will do.
+- Keep the application storage's own size limit at least as high as the profile's `max_bytes`, so that every file that passes the check can be written, and the application's limit stays a defense in depth.
+
 ---
 
 ## Security
@@ -1041,13 +1111,13 @@ Run one script with `php tests/storage_test.php`.
 |---|---|
 | `util_test.php` | `StoragePath`, `OriginalName`, `MimeMap`, `UploadRejection`, and the exception hierarchy |
 | `profile_test.php` | Every profile rule, the Registry baseline, memoization, inline profiles, and merge semantics |
-| `intake_test.php` | `UploadedFiles`, error-code mapping, check order, provenance, `storeUploads()` without HTTP, `rejectionMessage()`, and the language files |
+| `intake_test.php` | `UploadedFiles`, error-code mapping, check order, provenance, `checkUpload()` and `storeUploads()` without HTTP, `rejectionMessage()`, and the language files |
 | `storage_test.php` | Generic validation, plain writes, the result, routing, `$move`, and compensation |
 | `image_path_test.php` | The image path against a scripted `citomni/image` double: outputs, order, result fields, exception translation, and compensation |
 | `image_integration_test.php` | The real `citomni/image`: `finfo` against `inspect()` on crafted headers, and the happy path with GD |
 | `delete_test.php` | `delete*()` and `cleanup*()`, `cleanupStored()` included, on an in-memory storage and on the real filesystem |
 | `read_path_test.php` | `variantPath()`, `absolutePath()`, `webPath()`, and proof that they do no IO |
-| `http_upload_test.php` | End to end through PHP's built-in web server: `$_FILES` shapes, `storeUpload()` with real uploads and error codes, image uploads, and `storeUploads()` batches with partial acceptance and compensation |
+| `http_upload_test.php` | End to end through PHP's built-in web server: `$_FILES` shapes, `storeUpload()` with real uploads and error codes, image uploads, `checkUpload()` without writes, and `storeUploads()` batches with partial acceptance and compensation |
 
 The scripts require PHP 8.5, `ext-fileinfo`, and `ext-mbstring`, and the image checks require `ext-gd`. Every unsuppressed diagnostic fails a run, including deprecations and `#[\NoDiscard]` warnings. Failures are forced through the filesystem or through stream wrappers in `tests/Support/`; the production code has no test seams.
 
@@ -1060,7 +1130,7 @@ Checks the platform cannot support print a `SKIP:` line instead of failing:
 
 ### Mutation testing
 
-`tests/mutation/` holds a mutation runner and 84 mutants in the areas `profile`, `store`, `intake`, `batch`, `image`, `delete`, and `path`. It is not part of `composer test`.
+`tests/mutation/` holds a mutation runner and 88 mutants in the areas `profile`, `store`, `intake`, `batch`, `image`, `delete`, and `path`. It is not part of `composer test`.
 
 ```bash
 php tests/mutation/run.php            # All mutants.
