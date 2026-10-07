@@ -19,23 +19,35 @@ declare(strict_types=1);
  * "GET /?ping=1" answers {"pong":true}. A POST carries a JSON "spec" field and
  * file parts. Inside the request, where is_uploaded_file() and
  * move_uploaded_file() accept the uploaded files, the router runs the requested
- * UploadedFiles probes and storeUpload() calls and answers with a JSON report:
+ * UploadedFiles probes, storeUpload() calls, and storeUploads() batches, and
+ * answers with a JSON report:
  * - files: the raw $_FILES array
  * - probes: one result per ['one' | 'many', field, path] probe
  * - calls: per storeUpload() call, the result or the exception (class, message,
  *   reason, context), and whether the uploaded file still exists afterwards
+ * - batches: per storeUploads() call, the result keys, "stored", "rejected"
+ *   (class, reason, context), the result of cleanupStored() when the batch asks
+ *   for "discard", or the exception, and per entry whether its uploaded file
+ *   still exists afterwards (null for an entry without a string tmp_name)
  * - log: cleanup log entries; touched: service ids that Upload resolved
  *
  * A call's entry is 'one' (UploadedFiles::one() of the field), 'raw' (the raw
- * $_FILES entry), or an explicit array. spec.image picks the image service:
- * 'scripted' (ScriptedImage), 'real' (citomni/image), or the default double
- * that throws. Test-only: the server is bound to 127.0.0.1 and lives as long
- * as one test script.
+ * $_FILES entry), or an explicit array. A batch's entries are
+ * UploadedFiles::many() of its field and path, with the explicit entries of
+ * "insert" spliced in at the given positions. spec.image picks the image
+ * service: 'scripted' (ScriptedImage), 'real' (citomni/image), or the default
+ * double that throws. With spec.fail_save = n, the scripted save() throws
+ * ImageCapabilityException on its n-th call, before it writes anything; with
+ * spec.lock_on_fail, it first makes its target directory read-only (0555), so
+ * the batch's compensation cannot remove what the batch stored there.
+ * Test-only: the server is bound to 127.0.0.1 and lives as long as one test
+ * script.
  */
 
 require __DIR__ . '/../bootstrap.php';
 
 use CitOmni\Image\Boot\Registry as ImageRegistry;
+use CitOmni\Image\Exception\ImageCapabilityException;
 use CitOmni\Image\Service\Image;
 use CitOmni\Upload\Exception\UploadRejectedException;
 use CitOmni\Upload\Service\Upload;
@@ -54,7 +66,7 @@ try {
 	}
 
 	$spec = \json_decode((string)($_POST['spec'] ?? ''), true, 64, \JSON_THROW_ON_ERROR);
-	$report = ['files' => $_FILES, 'probes' => [], 'calls' => [], 'log' => [], 'touched' => []];
+	$report = ['files' => $_FILES, 'probes' => [], 'calls' => [], 'batches' => [], 'log' => [], 'touched' => []];
 
 	foreach ($spec['probes'] ?? [] as [$operation, $field, $path]) {
 		$report['probes'][] = $operation === 'one'
@@ -62,17 +74,36 @@ try {
 			: UploadedFiles::many($_FILES[$field] ?? null, ...$path);
 	}
 
-	if (isset($spec['calls'])) {
+	if (isset($spec['calls']) || isset($spec['batches'])) {
 		$log = new RecordingLog();
+		$scripted = new ScriptedImage();
+
+		if (isset($spec['fail_save'])) {
+			$failAt = $spec['fail_save'];
+			$lock = (bool)($spec['lock_on_fail'] ?? false);
+			$saves = 0;
+			$scripted->onSave = static function (string $source, array $outputs) use ($failAt, $lock, &$saves): array {
+				if (++$saves === $failAt) {
+					if ($lock) {
+						\chmod(\dirname(\reset($outputs)['path']), 0555);
+					}
+
+					throw new ImageCapabilityException('Scripted: no encoder for this job.');
+				}
+
+				return ScriptedImage::write($outputs);
+			};
+		}
+
 		$services = ['log' => $log] + match ($spec['image'] ?? null) {
-			'scripted' => ['image' => new ScriptedImage()],
+			'scripted' => ['image' => $scripted],
 			'real' => ['image' => static fn(TestApp $app): Image => new Image($app)],
 			default => [],
 		};
 		$app = testApp(testCfg(ImageRegistry::CFG_COMMON, ['upload' => ['storages' => ['files' => ['root' => $spec['root'], 'web_path' => null]]] + ($spec['upload'] ?? [])]), $services);
 		$upload = new Upload($app);
 
-		foreach ($spec['calls'] as $call) {
+		foreach ($spec['calls'] ?? [] as $call) {
 			$entry = match (true) {
 				\is_array($call['entry']) => $call['entry'],
 				$call['entry'] === 'raw' => $_FILES[$call['field']] ?? null,
@@ -95,6 +126,32 @@ try {
 			$tmpName = \is_array($entry) ? ($entry['tmp_name'] ?? null) : null;
 			$outcome['tmp_exists_after'] = \is_string($tmpName) && $tmpName !== '' ? \file_exists($tmpName) : null;
 			$report['calls'][] = $outcome;
+		}
+
+		foreach ($spec['batches'] ?? [] as $batch) {
+			$entries = UploadedFiles::many($_FILES[$batch['field']] ?? null, ...($batch['path'] ?? []));
+
+			foreach ($batch['insert'] ?? [] as [$position, $entry]) {
+				\array_splice($entries, $position, 0, [$entry]);
+			}
+
+			$outcome = [];
+
+			try {
+				$result = $upload->storeUploads($entries, $batch['profile'], $batch['subdir'] ?? '');
+				$outcome['keys'] = \array_keys($result);
+				$outcome['stored'] = $result['stored'];
+				$outcome['rejected'] = \array_map(static fn(UploadRejectedException $e): array => ['class' => $e::class, 'reason' => $e->reason->value, 'context' => $e->context], $result['rejected']);
+
+				if ($batch['discard'] ?? false) {
+					$outcome['discarded'] = $upload->cleanupStored(...$result['stored']);
+				}
+			} catch (\Throwable $e) {
+				$outcome['error'] = ['class' => $e::class, 'message' => $e->getMessage()];
+			}
+
+			$outcome['tmp_exists_after'] = \array_map(static fn(mixed $entry): ?bool => \is_string($entry['tmp_name'] ?? null) ? $entry['tmp_name'] !== '' && \file_exists($entry['tmp_name']) : null, $entries);
+			$report['batches'][] = $outcome;
 		}
 
 		$report['log'] = $log->entries;

@@ -44,6 +44,10 @@ use CitOmni\Upload\Util\StoragePath;
  * - Provenance: storeUpload() maps PHP's upload error code and requires
  *   is_uploaded_file(); storeLocal() requires a readable regular file. Both
  *   continue with the same pipeline.
+ * - Batches: storeUploads() runs storeUpload() for several entries with one
+ *   profile, collects rejections instead of stopping, and leaves the batch
+ *   policy to the caller. It is optional: storeUpload() remains the building
+ *   block for a caller with its own batch flow.
  * - Generic validation runs before anything is written. Size is measured by
  *   Upload (empty files and max_bytes), and the MIME type is detected by finfo,
  *   canonicalized, and matched exactly against the profile's accept list.
@@ -65,13 +69,17 @@ use CitOmni\Upload\Util\StoragePath;
  *   placed in storage, including citomni/image's outputs.
  * - Compensation: when a call fails before its commit point, the files it
  *   created are removed before the exception propagates (best effort, logged),
- *   including the outputs citomni/image reports as committed.
+ *   including the outputs citomni/image reports as committed. For
+ *   storeUploads(), these include the files of every entry stored before the
+ *   failure.
  * - rejectionMessage() turns a rejection into end-user text through the txt
  *   service when it is registered, with an English fallback.
  * - Deletion: delete() and deleteWithVariants() delete strictly and stop at the
- *   first file they cannot delete; cleanup() and cleanupWithVariants() remove
- *   best effort, log failures, and report whether everything is gone. The
- *   *WithVariants() methods remove the variants before the main file.
+ *   first file they cannot delete; cleanup(), cleanupWithVariants(), and
+ *   cleanupStored() remove best effort, log failures, and report whether
+ *   everything is gone. cleanupStored() removes exactly the files listed in
+ *   store results. The *WithVariants() methods and cleanupStored() remove the
+ *   variants before the main file.
  * - Path methods: variantPath(), absolutePath(), and webPath() derive paths
  *   from configuration alone, without filesystem access, finfo, or
  *   citomni/image.
@@ -222,6 +230,96 @@ final class Upload extends BaseService {
 		}
 
 		return $this->ingest($tmpName, $resolved, $subdir, $originalName, true);
+	}
+
+
+	/**
+	 * Validate and store several files uploaded in the current HTTP request with one profile.
+	 *
+	 * Behavior:
+	 * - Resolves the profile, validates $subdir and the shape of every entry, and
+	 *   checks the storage preconditions (root, file_mode, dir_mode) first, in
+	 *   storeUpload()'s order and also for an empty list. Developer and
+	 *   configuration errors therefore surface before anything is stored, even
+	 *   when no file was sent.
+	 * - Stores the entries in the given order through storeUpload(), with the
+	 *   same profile and $subdir for every entry.
+	 * - Partial acceptance: a rejected file is collected in "rejected", and the
+	 *   next entry is stored. A rejected upload stays with PHP, as after a
+	 *   rejected storeUpload().
+	 * - Compensation: any other exception (configuration, storage, capability,
+	 *   or a developer error such as an entry that was not uploaded in the
+	 *   current request) removes the files of the entries stored before it, then
+	 *   propagates (best effort, logged). The failing entry's own files are
+	 *   removed by storeUpload(), as always.
+	 *
+	 * Notes:
+	 * - Optional: a caller that needs per-file profiles or subdirectories, or its
+	 *   own batch flow, loops over storeUpload() instead.
+	 * - "stored" and "rejected" are lists in client order; the keys of $files are
+	 *   not kept. Entries from UploadedFiles::many() never give NoFile, so every
+	 *   rejection's context then carries original_name.
+	 * - The batch policy stays with the caller. Partial acceptance persists
+	 *   "stored" and reports "rejected"; all-or-nothing removes "stored" with
+	 *   cleanupStored() when "rejected" is not empty. A maximum file count is the
+	 *   caller's as well: a pre-check before the call, enforced where the results
+	 *   are persisted.
+	 * - Persisting the results is the caller's commit point. When persistence
+	 *   fails, the caller removes "stored" with cleanupStored().
+	 * - Ignoring the result means stored files whose paths are never persisted.
+	 *
+	 * Typical usage:
+	 *   $batch = $this->app->upload->storeUploads(UploadedFiles::many($_FILES['photos'] ?? null), 'gallery', $uploadToken);
+	 *   foreach ($batch['rejected'] as $e) {
+	 *       $messages[] = $e->context['original_name'] . ': ' . $this->app->upload->rejectionMessage($e);
+	 *   }
+	 *
+	 * @param list<array<string, mixed>> $files Entries from UploadedFiles::many(), in client order.
+	 * @param string|array<string, mixed> $profile Profile name in upload.profiles, or an inline profile array.
+	 * @param string $subdir Storage-relative directory below the profile's directory; "" for none.
+	 * @return array{stored: list<array<string, mixed>>, rejected: list<UploadRejectedException>} Results shaped like storeUpload()'s, and the rejections; both in client order.
+	 * @throws UploadConfigException When the profile, its storage, the storage root, file_mode, or dir_mode is invalid, or citomni/image rejects the profile's output specs or options.
+	 * @throws UploadStorageException When PHP reports a server-side upload error, moving or writing a file fails, a target already exists, or citomni/image cannot publish all outputs.
+	 * @throws \InvalidArgumentException When $subdir is invalid, an entry is not an array with a string name, a string tmp_name, and an int error, or a file was not uploaded in the current request.
+	 * @throws \CitOmni\Image\Exception\ImageCapabilityException When no backend can decode or encode a required format (propagated unchanged).
+	 */
+	#[\NoDiscard]
+	public function storeUploads(array $files, string|array $profile, string $subdir = ''): array {
+		// Developer and configuration errors surface first, in storeUpload()'s order, also when no file was sent.
+		$resolved = $this->resolveProfile($profile);
+		StoragePath::validateRelative($subdir);
+
+		foreach ($files as $file) {
+			if (!\is_array($file) || !\is_string($file['name'] ?? null) || !\is_string($file['tmp_name'] ?? null) || !\is_int($file['error'] ?? null)) {
+				throw new \InvalidArgumentException('storeUploads() expects a list of file entries, each with a string name, a string tmp_name, and an int error; obtain it with UploadedFiles::many(). A single entry goes to storeUpload().');
+			}
+		}
+
+		$root = $this->storageRoot($resolved['storage']);
+		$this->modes();
+
+		$stored = [];
+		$rejected = [];
+		$complete = false;
+
+		try {
+			foreach ($files as $file) {
+				try {
+					$stored[] = $this->storeUpload($file, $profile, $subdir);
+				} catch (UploadRejectedException $e) {
+					$rejected[] = $e;
+				}
+			}
+
+			$complete = true;
+		} finally {
+			if (!$complete) {
+				// A failure part-way: the files of earlier entries must not linger.
+				$this->discardResults($stored, $resolved['storage'], $root);
+			}
+		}
+
+		return ['stored' => $stored, 'rejected' => $rejected];
 	}
 
 
@@ -461,6 +559,78 @@ final class Upload extends BaseService {
 		$resolved = $this->resolveProfile($profile);
 
 		return $this->cleanupFiles($resolved['storage'], $this->storageRoot($resolved['storage']), self::profileFiles($path, $resolved));
+	}
+
+
+	/**
+	 * Remove exactly the files listed in store results, with cleanup semantics.
+	 *
+	 * Behavior:
+	 * - Takes results of storeUpload(), storeLocal(), or the "stored" list of
+	 *   storeUploads(). Every result and path is validated before the first
+	 *   filesystem call, and every storage root before anything is removed:
+	 *   each result needs a string storage, a valid path, and a variants array
+	 *   whose entries have a valid path, and each storage an existing root.
+	 * - Per result, attempts every variant, in result order, and then the main
+	 *   file, even when an earlier file cannot be removed.
+	 * - Failures are logged per file, as in cleanup(), and make the result false.
+	 *   Filesystem failures never throw, so cleanupStored() is safe in finally
+	 *   blocks. No results means nothing to remove, which is true.
+	 *
+	 * Notes:
+	 * - Use it for results that were not committed: compensating a failed
+	 *   persistence, or discarding an all-or-nothing batch with rejections. A
+	 *   path read back from a record is removed with cleanup() or
+	 *   cleanupWithVariants().
+	 * - Needs neither the profile nor the image service: the result lists its
+	 *   own files, so a later profile change does not change what is removed.
+	 *
+	 * Typical usage:
+	 *   $this->app->upload->cleanupStored(...$batch['stored']);
+	 *
+	 * @param array<string, mixed> ...$stored Store results.
+	 * @return bool True when every listed file is gone.
+	 * @throws \InvalidArgumentException When a result lacks a string storage, a string path, or a variants array with string paths, or a path is empty or invalid.
+	 * @throws UploadConfigException When a storage is not configured or its root does not exist.
+	 */
+	public function cleanupStored(array ...$stored): bool {
+		$jobs = [];
+
+		foreach ($stored as $result) {
+			$storage = $result['storage'] ?? null;
+			$path = $result['path'] ?? null;
+			$variants = $result['variants'] ?? null;
+
+			if (!\is_string($storage) || !\is_string($path) || !\is_array($variants)) {
+				throw new \InvalidArgumentException("cleanupStored() expects store results with a string 'storage', a string 'path', and a 'variants' array. Pass a batch as cleanupStored(...\$batch['stored']); remove a path read back from a record with cleanup() or cleanupWithVariants().");
+			}
+
+			$paths = [];
+
+			foreach ($variants as $variant) {
+				if (!\is_string($variant['path'] ?? null)) {
+					throw new \InvalidArgumentException("cleanupStored() expects every entry in 'variants' to have a string 'path'.");
+				}
+
+				$paths[] = $variant['path'];
+			}
+
+			$paths[] = $path;
+			$jobs[] = [$storage, self::filePaths($paths)];
+		}
+
+		// Every root is verified before the first file of any result is removed.
+		foreach ($jobs as [$storage]) {
+			$this->storageRoot($storage);
+		}
+
+		$gone = true;
+
+		foreach ($jobs as [$storage, $paths]) {
+			$gone = $this->cleanupFiles($storage, $this->storageRoot($storage), $paths) && $gone;
+		}
+
+		return $gone;
 	}
 
 
@@ -1550,6 +1720,32 @@ final class Upload extends BaseService {
 		foreach ($paths as $path) {
 			$this->removeFile($path, 'Failed to remove a file written by an aborted store.', ['storage' => $storage, 'path' => $path]);
 		}
+	}
+
+
+	/**
+	 * Remove the files of results stored earlier in an aborted batch.
+	 *
+	 * Every file is attempted, failures are logged as in discard(), and nothing
+	 * is thrown.
+	 *
+	 * @param list<array<string, mixed>> $results Results of successful stores in the same call.
+	 * @param string $storage Storage of the batch's profile, for the log context.
+	 * @param string $root Verified root of that storage.
+	 * @return void
+	 */
+	private function discardResults(array $results, string $storage, string $root): void {
+		$paths = [];
+
+		foreach ($results as $result) {
+			foreach ($result['variants'] as $variant) {
+				$paths[] = self::absolute($root, $variant['path']);
+			}
+
+			$paths[] = self::absolute($root, $result['path']);
+		}
+
+		$this->discard($paths, $storage);
 	}
 
 

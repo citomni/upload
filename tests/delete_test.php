@@ -15,11 +15,12 @@ declare(strict_types=1);
 
 /*
  * Deletion contract: strict delete() and deleteWithVariants() versus
- * best-effort cleanup() and cleanupWithVariants(). Path validation before any
- * filesystem call, storage and profile errors, missing files, files that
- * cannot be deleted, ordering (variants before the main file), stopping at the
- * first failure versus attempting every file, cleanup logging, and cleanup in
- * a finally block that must not mask the exception in flight.
+ * best-effort cleanup(), cleanupWithVariants(), and cleanupStored(). Path
+ * validation before any filesystem call, storage and profile errors, missing
+ * files, files that cannot be deleted, ordering (variants before the main
+ * file), stopping at the first failure versus attempting every file, cleanup
+ * logging, cleanup in a finally block that must not mask the exception in
+ * flight, and cleanupStored()'s validation of store results.
  *
  * Ordering and failures run on MemoryStorage, an in-memory storage behind a
  * stream wrapper that records every unlink and refuses chosen files, so they
@@ -246,6 +247,105 @@ $upload->deleteWithVariants('doc.pdf', $attachment);
 check(MemoryStorage::unlinked() === ["{$root}/doc.pdf"] && MemoryStorage::exists("{$root}/doc-thumb.webp"), 'a profile without image block deletes only the main file');
 
 
+// -- cleanupStored(): exactly the files a store result lists -----------------------
+
+/**
+ * A store result shaped like storeUpload()'s.
+ *
+ * @param array<string, string> $variants Variant key => storage-relative path.
+ */
+$storeResult = static fn(string $path, array $variants = [], string $storage = 'files'): array => [
+	'storage' => $storage,
+	'path' => $path,
+	'mime' => 'image/webp',
+	'source_mime' => 'image/jpeg',
+	'size' => 1,
+	'original_name' => 'photo.jpg',
+	'width' => 1,
+	'height' => 1,
+	'hash' => null,
+	'variants' => \array_map(static fn(string $variant): array => ['path' => $variant, 'mime' => 'image/webp', 'size' => 1, 'width' => 1, 'height' => 1], $variants),
+];
+
+[$upload, $root, $log, $app] = $memory();
+check($upload->cleanupStored() === true && MemoryStorage::$operations === [], 'cleanupStored() without results touches nothing and is true');
+
+$photo = $storeResult($main, ['small' => $variantFiles[1], 'thumb' => $variantFiles[0]]);
+$putAll($root, [...$variantFiles, $main, 'docs/report.pdf']);
+check($upload->cleanupStored($photo, $storeResult('docs/report.pdf'), $storeResult('docs/missing.pdf')) === true, 'cleanupStored() reports true when every listed file is gone; a missing file counts as removed');
+check(MemoryStorage::unlinked() === $urls($root, [$variantFiles[1], $variantFiles[0], $main, 'docs/report.pdf', 'docs/missing.pdf']), 'per result, the variants in result order, then the main file; the results in the given order');
+check(MemoryStorage::exists("{$root}/{$variantFiles[2]}"), 'a file the result does not list stays, even where the profile would derive it');
+check($log->entries === [] && !\in_array('image', $app->touched, true), 'cleanupStored() needs no profile, never resolves image, and logs nothing on success');
+
+[$upload, $root] = $memory(['image' => null]);
+MemoryStorage::put("{$root}/{$main}");
+check($upload->cleanupStored($storeResult($main)) === true && !MemoryStorage::exists("{$root}/{$main}"), 'cleanupStored() works without a registered image service');
+
+[$upload, $root, $log] = $memory();
+$putAll($root, [$variantFiles[0], $main, 'docs/report.pdf']);
+MemoryStorage::$undeletable["{$root}/{$variantFiles[0]}"] = true;
+check($upload->cleanupStored($storeResult($main, ['thumb' => $variantFiles[0]]), $storeResult('docs/report.pdf')) === false, 'cleanupStored() reports false when a listed file remains');
+check(MemoryStorage::unlinked() === $urls($root, [$variantFiles[0], $main, 'docs/report.pdf']), 'cleanupStored() attempts every file of every result despite a failure');
+check(\array_values(\array_filter($urls($root, [$variantFiles[0], $main, 'docs/report.pdf']), MemoryStorage::exists(...))) === ["{$root}/{$variantFiles[0]}"], 'only the refused file remains');
+check(
+	\count($log->entries) === 1 && $log->entries[0]['message'] === 'Failed to remove a stored file during cleanup.'
+	&& $log->entries[0]['context']['stored_path'] === $variantFiles[0] && $log->entries[0]['context']['path'] === "{$root}/{$variantFiles[0]}",
+	'the failure is logged as by cleanup(), with the file\'s own storage-relative path'
+);
+
+[$upload, $root] = $memory();
+$valid = $storeResult($main, ['thumb' => $variantFiles[0]]);
+$putAll($root, [$variantFiles[0], $main]);
+$malformedResults = [
+	'no storage' => \array_diff_key($valid, ['storage' => true]),
+	'an int storage' => ['storage' => 1] + $valid,
+	'no path' => \array_diff_key($valid, ['path' => true]),
+	'no variants' => \array_diff_key($valid, ['variants' => true]),
+	'null variants' => ['variants' => null] + $valid,
+	'a variant without a path' => ['variants' => ['thumb' => ['mime' => 'image/webp']]] + $valid,
+	'a variant that is a string' => ['variants' => ['thumb' => $variantFiles[0]]] + $valid,
+	'an empty path' => ['path' => ''] + $valid,
+	'an invalid path' => ['path' => '../x.webp'] + $valid,
+	'an invalid variant path' => ['variants' => ['thumb' => ['path' => 'u1//x.webp']]] + $valid,
+];
+
+foreach ($malformedResults as $why => $result) {
+	expectThrows(\InvalidArgumentException::class, static fn() => $upload->cleanupStored($valid, $result), "cleanupStored() rejects a result with {$why}");
+}
+
+check(MemoryStorage::$operations === [] && MemoryStorage::exists("{$root}/{$main}"), 'every result is validated before the first filesystem call: a malformed result removes nothing, not even the valid one before it');
+
+$e = expectThrows(\InvalidArgumentException::class, static fn() => $upload->cleanupStored([$valid]), 'cleanupStored() of a list instead of results');
+check(\str_contains($e->getMessage(), "cleanupStored(...\$batch['stored'])") && \str_contains($e->getMessage(), 'cleanupWithVariants()'), 'the message shows how to pass a batch and where a path read back from a record goes');
+
+MemoryStorage::reset();
+$filesRoot = MemoryStorage::root('files');
+$otherRoot = MemoryStorage::root('other');
+$mixed = new Upload(testApp(testCfg(['upload' => ['storages' => [
+	'files' => ['root' => $filesRoot, 'web_path' => null],
+	'other' => ['root' => $otherRoot, 'web_path' => null],
+	'gone' => ['root' => $dir . '/no-such-root', 'web_path' => null],
+]]])));
+MemoryStorage::put("{$filesRoot}/a.pdf");
+MemoryStorage::put("{$otherRoot}/b.pdf");
+expectThrows(UploadConfigException::class, static fn() => $mixed->cleanupStored($storeResult('a.pdf'), $storeResult('c.pdf', [], 'nope')), 'cleanupStored() with a result in an undefined storage');
+expectThrows(UploadConfigException::class, static fn() => $mixed->cleanupStored($storeResult('a.pdf'), $storeResult('c.pdf', [], 'gone')), 'cleanupStored() with a result in a storage whose root does not exist');
+check(MemoryStorage::unlinked() === [] && MemoryStorage::exists("{$filesRoot}/a.pdf"), 'every storage root is verified before anything is removed');
+check($mixed->cleanupStored($storeResult('a.pdf'), $storeResult('b.pdf', [], 'other')) === true && MemoryStorage::unlinked() === ["{$filesRoot}/a.pdf", "{$otherRoot}/b.pdf"], 'each result is removed from its own storage');
+
+[$upload, $root] = $memory(['log' => $throwing]);
+MemoryStorage::put("{$root}/{$main}");
+MemoryStorage::$undeletable["{$root}/{$main}"] = true;
+$e = expectThrows(\DomainException::class, static function () use ($upload, $storeResult, $main): void {
+	try {
+		throw new \DomainException('in flight');
+	} finally {
+		$upload->cleanupStored($storeResult($main));
+	}
+}, 'cleanupStored() in a finally block while an exception is in flight');
+check($e->getMessage() === 'in flight' && $e->getPrevious() === null, 'cleanupStored() in a finally block does not mask the exception in flight, even with a failing unlink and a throwing log');
+
+
 // -- Real filesystem: delete exactly what a store wrote ----------------------------
 
 $realRoot = $dir . '/storage';
@@ -277,6 +377,12 @@ $real->deleteWithVariants($produced['path'], $avatarReal);
 check($real->cleanupWithVariants($kept['path'], $archive) === true, 'deleting again succeeds: missing files count as deleted');
 check(\count($image->calls) === $calls && $realLog->entries === [], 'deletion never calls citomni/image and logs nothing on success');
 check(\is_dir($realRoot . '/u1'), 'deletion removes files, not directories');
+
+$fresh = [$real->storeLocal($jpeg, $avatarReal, 'u4'), $real->storeLocal($jpeg, $archive, 'u5'), $real->storeLocal($pdf, $avatarReal, 'u6')];
+$calls = \count($image->calls);
+check(\count(filesUnder($realRoot)) === 7, 'three more stores wrote seven files');
+check($real->cleanupStored(...$fresh) === true && filesUnder($realRoot) === [], 'cleanupStored() removes exactly what the stores wrote, from their results alone');
+check(\count($image->calls) === $calls && $realLog->entries === [], 'cleanupStored() never calls citomni/image and logs nothing on success');
 
 
 // -- Real filesystem: refused unlinks (non-root POSIX or Windows) ------------------

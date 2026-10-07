@@ -14,14 +14,15 @@ declare(strict_types=1);
  */
 
 /*
- * End-to-end checks for storeUpload() with real HTTP uploads.
+ * End-to-end checks for storeUpload() and storeUploads() with real HTTP uploads.
  *
  * is_uploaded_file() and move_uploaded_file() only accept files uploaded in
  * the current request. This script therefore starts PHP's built-in web server
  * on 127.0.0.1 and a free port, sends raw multipart/form-data requests, and
- * lets tests/Support/http_router.php call UploadedFiles and storeUpload()
- * inside each request. The router reports results, exceptions, and the state
- * of the uploaded files as JSON; this script inspects storage directly.
+ * lets tests/Support/http_router.php call UploadedFiles, storeUpload(),
+ * storeUploads(), and cleanupStored() inside each request. The router reports
+ * results, exceptions, and the state of the uploaded files as JSON; this
+ * script inspects storage directly.
  *
  * The server is stopped in finally, so a failed check never leaves it running.
  * The script skips itself outside the CLI, without proc_open(), or when the
@@ -31,7 +32,9 @@ declare(strict_types=1);
 require __DIR__ . '/bootstrap.php';
 
 use CitOmni\Image\Boot\Registry as ImageRegistry;
+use CitOmni\Image\Exception\ImageCapabilityException;
 use CitOmni\Image\Service\Image;
+use CitOmni\Upload\Exception\UploadRejectedException;
 use CitOmni\Upload\Exception\UploadStorageException;
 use CitOmni\Upload\Tests\Support\Fixtures;
 use CitOmni\Upload\Tests\Support\HttpServer;
@@ -274,6 +277,131 @@ try {
 		);
 	} else {
 		skip('image upload with the real citomni/image', 'ext-gd with JPEG decoding and WebP encoding is not available');
+	}
+
+	// -- Batches: storeUploads() --------------------------------------------------------------
+
+	$resultKeys = ['storage', 'path', 'mime', 'source_mime', 'size', 'original_name', 'width', 'height', 'hash', 'variants'];
+	$pdfs = [$pdf . "%a\n", $pdf . "%b\n", $pdf . "%c\n"];
+
+	$root = $newRoot();
+	$report = $request(['root' => $root, 'batches' => [['field' => 'docs', 'profile' => $pdfProfile, 'subdir' => 'batch']]], [
+		['docs[]', 'a.pdf', $pdfs[0]],
+		['docs[]', 'evil.pdf', Fixtures::php()],
+		['docs[]', '', ''],
+		['docs[]', 'b.pdf', $pdfs[1]],
+		['docs[]', 'empty.pdf', ''],
+		['docs[]', 'big.pdf', \str_repeat('x', 2048)],
+		['docs[]', 'c.pdf', $pdfs[2]],
+	]);
+	$batch = $report['batches'][0];
+	$stored = $batch['stored'] ?? [];
+	$rejected = $batch['rejected'] ?? [];
+	$paths = \array_column($stored, 'path');
+	\sort($paths);
+
+	check(($batch['keys'] ?? null) === ['stored', 'rejected'], 'storeUploads() returns stored and rejected, in that order');
+	check(\array_column($stored, 'original_name') === ['a.pdf', 'b.pdf', 'c.pdf'], 'partial acceptance: every accepted file is stored, in client order');
+	check(
+		\array_filter($stored, static fn(array $result): bool => \array_keys($result) !== $resultKeys || \preg_match('~^batch/[0-9a-f]{32}\.pdf$~D', $result['path']) !== 1) === [],
+		'every stored entry is a storeUpload() result below the batch $subdir'
+	);
+	check(\array_map(static fn(array $result): string => (string)\file_get_contents($root . '/' . $result['path']), $stored) === $pdfs && filesUnder($root) === $paths, 'each result points to its own file, and only the accepted files are stored');
+	check(\array_column($rejected, 'reason') === ['type_not_allowed', 'empty', 'too_large'], 'every rejection is collected, in client order, instead of stopping the batch');
+	check(\array_unique(\array_column($rejected, 'class')) === [UploadRejectedException::class], 'the rejections are the UploadRejectedException instances storeUpload() throws');
+	check(
+		\array_column(\array_column($rejected, 'context'), 'original_name') === ['evil.pdf', 'empty.pdf', 'big.pdf'] && $rejected[2]['context'] === ['original_name' => 'big.pdf', 'upload_error' => \UPLOAD_ERR_INI_SIZE],
+		'each rejection keeps its context, so the adapter can name the file'
+	);
+	check(($batch['tmp_exists_after'] ?? null) === [false, true, false, true, false, false], 'stored uploads are consumed, rejected uploads stay with PHP, and many() skipped the empty slot');
+	check($report['log'] === [] && !\in_array('image', $report['touched'], true) && !\in_array('txt', $report['touched'], true), 'a plain batch resolves neither image nor txt, and logs nothing');
+
+	$root = $newRoot();
+	$report = $request(['root' => $root, 'batches' => [['field' => 'docs', 'profile' => $pdfProfile, 'discard' => true]]], [
+		['docs[]', 'a.pdf', $pdfs[0]],
+		['docs[]', 'evil.pdf', Fixtures::php()],
+		['docs[]', 'b.pdf', $pdfs[1]],
+	]);
+	$batch = $report['batches'][0];
+	check(\count($batch['stored'] ?? []) === 2 && \count($batch['rejected'] ?? []) === 1 && ($batch['discarded'] ?? null) === true, 'all-or-nothing on top: cleanupStored() removes the stored files of a batch with a rejection and reports true');
+	check(filesUnder($root) === [] && $report['log'] === [], 'nothing of the discarded batch remains, and nothing is logged');
+
+	$root = $newRoot();
+	$forged = $dir . '/forged.pdf';
+	\file_put_contents($forged, $pdf);
+	$report = $request(['root' => $root, 'batches' => [[
+		'field' => 'docs',
+		'profile' => $pdfProfile,
+		'insert' => [[2, ['name' => 'forged.pdf', 'type' => 'application/pdf', 'tmp_name' => $forged, 'error' => \UPLOAD_ERR_OK, 'size' => \strlen($pdf)]]],
+	]]], [['docs[]', 'a.pdf', $pdfs[0]], ['docs[]', 'b.pdf', $pdfs[1]], ['docs[]', 'c.pdf', $pdfs[2]]]);
+	$batch = $report['batches'][0];
+	check(($batch['error']['class'] ?? null) === \InvalidArgumentException::class && !isset($batch['stored']), 'a fault part-way through a batch propagates: here an entry that was not uploaded in the request');
+	check(filesUnder($root) === [] && ($batch['tmp_exists_after'] ?? null) === [false, false, true, true], 'the files of the entries stored before the fault are removed, and later entries are never attempted');
+	check($report['log'] === [] && \file_get_contents($forged) === $pdf, 'the compensation succeeds silently, and the file of the forged entry is untouched');
+
+	$root = $newRoot();
+	$report = $request(['root' => $root, 'batches' => [['field' => 'docs', 'profile' => $pdfProfile, 'insert' => [[2, ['name' => 'no-tmp-name.pdf', 'error' => \UPLOAD_ERR_OK]]]]]], [
+		['docs[]', 'a.pdf', $pdfs[0]],
+		['docs[]', 'b.pdf', $pdfs[1]],
+		['docs[]', 'c.pdf', $pdfs[2]],
+	]);
+	$batch = $report['batches'][0];
+	check(
+		($batch['error']['class'] ?? null) === \InvalidArgumentException::class && filesUnder($root) === [] && ($batch['tmp_exists_after'] ?? null) === [true, true, null, true],
+		'a malformed entry is reported before anything is stored: every upload stays with PHP'
+	);
+
+	$root = $newRoot();
+	$photo = Fixtures::jpeg();
+	$report = $request(['root' => $root, 'image' => 'scripted', 'batches' => [
+		['field' => 'keep', 'profile' => $keep, 'subdir' => 'gallery'],
+		['field' => 'drop', 'profile' => $keep, 'subdir' => 'gallery', 'discard' => true],
+	]], [['keep[]', 'one.jpg', $photo], ['keep[]', 'two.jpg', $photo], ['drop[]', 'three.jpg', $photo]]);
+	[$kept, $dropped] = $report['batches'];
+	$files = [];
+
+	foreach ($kept['stored'] ?? [] as $result) {
+		\array_push($files, $result['path'], $result['variants']['preview']['path'] ?? '');
+	}
+
+	\sort($files);
+	check(\count($kept['stored'] ?? []) === 2 && filesUnder($root) === $files, 'an image batch stores each kept original with its preview, and every result lists both');
+	check(\count($dropped['stored'] ?? []) === 1 && ($dropped['discarded'] ?? null) === true, 'cleanupStored() removes a discarded image result, its preview and its original');
+
+	$root = $newRoot();
+	$report = $request(['root' => $root, 'image' => 'scripted', 'fail_save' => 2, 'batches' => [['field' => 'photos', 'profile' => $keep, 'subdir' => 'gallery']]], [
+		['photos[]', 'one.jpg', $photo],
+		['photos[]', 'two.jpg', $photo],
+		['photos[]', 'three.jpg', $photo],
+	]);
+	$batch = $report['batches'][0];
+	check(($batch['error']['class'] ?? null) === ImageCapabilityException::class, 'an ImageCapabilityException part-way through an image batch propagates unchanged');
+	check(filesUnder($root) === [] && ($batch['tmp_exists_after'] ?? null) === [false, true, true], 'the original and preview of the first photo are removed; the failing and later photos stay with PHP');
+	check($report['log'] === [], 'the compensation of an image batch logs nothing when every file goes');
+
+	if (isWindows() || !canForceUndeletableFile()) {
+		skip('batch compensation with files the filesystem refuses to remove', 'needs a non-root POSIX user');
+	} else {
+		$root = $newRoot();
+
+		try {
+			$report = $request(['root' => $root, 'image' => 'scripted', 'fail_save' => 2, 'lock_on_fail' => true, 'batches' => [['field' => 'photos', 'profile' => $keep, 'subdir' => 'gallery']]], [
+				['photos[]', 'one.jpg', $photo],
+				['photos[]', 'two.jpg', $photo],
+			]);
+		} finally {
+			\chmod($root . '/gallery', 0755);
+		}
+
+		$batch = $report['batches'][0];
+		$log = $report['log'];
+		check(($batch['error']['class'] ?? null) === ImageCapabilityException::class && \count(filesUnder($root)) === 2, 'a refused removal during batch compensation does not mask the exception in flight, and the two files stay');
+		check(
+			\count($log) === 2 && \array_unique(\array_column($log, 'message')) === ['Failed to remove a file written by an aborted store.']
+			&& \array_unique(\array_column($log, 'category')) === ['cleanup'] && \array_keys($log[0]['context']) === ['storage', 'path', 'error']
+			&& $log[0]['context']['storage'] === 'files' && \str_starts_with($log[0]['context']['path'], $root . '/gallery/'),
+			'every file the batch compensation could not remove is logged as a file of an aborted store'
+		);
 	}
 } finally {
 	$server->stop();

@@ -10,14 +10,14 @@ Upload knows **when** an accepted file needs image processing, **which** outputs
 
 ## What this package is
 
-`citomni/upload` is one transport-agnostic intake engine for HTTP and CLI. A store call handles one file:
+`citomni/upload` is one transport-agnostic intake engine for HTTP and CLI. `storeUpload()` and `storeLocal()` handle one file:
 
 1. It checks the profile, the arguments, and the storage configuration.
 2. It validates the file: provenance, size, and the content type detected with `finfo`.
 3. It stores the file under a fresh random name. For an image profile, `citomni/image` produces the image outputs at paths Upload chose.
 4. It returns a plain array with the storage-relative path and metadata.
 
-The application persists that array. Upload knows nothing about databases, users, or entities.
+The application persists that array. Upload knows nothing about databases, users, or entities. For a multi-file field, `storeUploads()` runs the same steps for every file and returns the results together with the rejections.
 
 ---
 
@@ -30,7 +30,8 @@ The application persists that array. Upload knows nothing about databases, users
 - Writing plain files, including an image original kept byte for byte.
 - The mode of every file placed in storage, `citomni/image`'s outputs included.
 - Which image outputs a profile wants, and their roles.
-- Removing what a failed store call wrote, including the outputs `citomni/image` committed.
+- Removing what a failed store call wrote, including the outputs `citomni/image` committed and, for a batch, the files stored before the failure.
+- The mechanics of a batch: one profile for every file, rejections collected instead of stopping, and removal of exactly the files a store result lists.
 - Deleting stored files and deriving their paths.
 
 ---
@@ -38,7 +39,7 @@ The application persists that array. Upload knows nothing about databases, users
 ## What this package does not own
 
 - **Image processing.** Decoding, EXIF and HEIF orientation, resizing, cropping, fit geometry, alpha and flattening, encoding and quality settings, pixel and memory guards, codec and backend detection, image defaults (`image.*`), and the write safety of image outputs all belong to `citomni/image`. When a generic image capability is missing, `citomni/image` is extended; Upload does not reimplement it.
-- **Persistence and domain rules.** Database access, media libraries, retention, limits such as a maximum number of files per entity, and the decision to remove an old file belong to the application.
+- **Persistence and domain rules.** Database access, media libraries, retention, limits such as a maximum number of files per entity, the batch policy (all-or-nothing or partial acceptance), and the decision to remove an old file belong to the application.
 - **The public upload area.** CitOmni's application scaffold (`citomni/http`) provides the directory and its server configuration; Upload states its [requirements](#web-server-configuration-for-public-storage).
 - **URLs.** `webPath()` returns a relative path; the base URL belongs to the HTTP layer.
 - **Users, tenants, and access control.**
@@ -326,6 +327,9 @@ final class Upload extends BaseService {
 	public function storeUpload(array $file, string|array $profile, string $subdir = ''): array {}
 
 	#[\NoDiscard]
+	public function storeUploads(array $files, string|array $profile, string $subdir = ''): array {}
+
+	#[\NoDiscard]
 	public function storeLocal(string $sourcePath, string|array $profile, string $subdir = '', ?string $originalName = null, bool $move = false): array {}
 
 	public function rejectionMessage(UploadRejectedException|UploadRejection $rejection): string {}
@@ -337,6 +341,8 @@ final class Upload extends BaseService {
 	public function cleanup(string $storage, string ...$paths): bool {}
 
 	public function cleanupWithVariants(string $path, string|array $profile): bool {}
+
+	public function cleanupStored(array ...$stored): bool {}
 
 	public function variantPath(string $path, string $variant, string|array $profile): string {}
 
@@ -360,7 +366,7 @@ MimeMap::extension(string $canonicalMime): string
 MimeMap::imageFormat(string $canonicalMime): ?ImageFormat
 ```
 
-- `storeUpload()` and `storeLocal()` carry `#[\NoDiscard]`, because a stored file whose path is never persisted is an orphan. `delete*()` and `cleanup*()` do not; callers deliberately ignore cleanup results.
+- `storeUpload()`, `storeUploads()`, and `storeLocal()` carry `#[\NoDiscard]`, because a stored file whose path is never persisted is an orphan. `delete*()` and `cleanup*()` do not; callers deliberately ignore cleanup results.
 - The service does no work at construction. Named profiles, storage roots, web paths, modes, and the `finfo` instance are resolved lazily and memoized per service instance. `$this->app->image` is resolved only on the image path, because its initialization reads and validates `image.*`.
 - Deletion and the path methods are described under [Deleting files and deriving paths](#deleting-files-and-deriving-paths).
 
@@ -374,6 +380,22 @@ Stores a file uploaded in the current HTTP request.
 - The client's `type` and `size` are never used. Its `name` becomes sanitized metadata (`original_name`) and never part of a path.
 - When Upload stores the original itself (a plain file, or an image whose `main` is `null`), it moves the upload with `move_uploaded_file()`, and storing the same entry again throws `\InvalidArgumentException`. A re-encoded main leaves the upload with PHP, which deletes it when the request ends.
 - A rejection leaves the upload where PHP put it, so the same entry can be stored again within the request, for example with another profile. A failure after the move removes the moved data along with the call's other files; the client has to upload again.
+
+### `storeUploads()`
+
+Stores the files of a multi-file field with one profile. It is optional: it calls `storeUpload()` for every entry and adds the batch mechanics that nearly every multi-file form needs, while the batch policy stays with the application.
+
+```php
+$batch = $this->app->upload->storeUploads(UploadedFiles::many($_FILES['attachments'] ?? null), 'attachment', (string)$ownerId);
+// ['stored' => list of results, 'rejected' => list of UploadRejectedException]
+```
+
+- `$files` is a list of entries, normally from `UploadedFiles::many()`, which skips slots without a file. Every entry is stored with the same profile and `$subdir`, in the given order.
+- The profile, `$subdir`, the shape of every entry, the storage root, and the modes are checked first, in `storeUpload()`'s order and also for an empty list. A developer or configuration error therefore surfaces before anything is stored, even when no file was sent. An entry that is not an array with a string `name`, a string `tmp_name`, and an int `error` throws `\InvalidArgumentException`.
+- Partial acceptance: a rejected file goes to `rejected`, and the next entry is stored. `stored` holds results in the [result format](#result-format) and `rejected` the exceptions, both as lists in client order; the keys of `$files` are not kept. Entries from `UploadedFiles::many()` never give `NoFile`, so every rejection's `context` then carries `original_name`, and the adapter can name the file. A rejected upload stays with PHP, as after a rejected `storeUpload()`.
+- Any other exception aborts the batch: the files of the entries stored before it are removed (best effort, logged), and the exception propagates. The failing entry's own files are removed by `storeUpload()`, and later entries are not attempted.
+- Persisting `stored` is the caller's commit point. All-or-nothing is a policy on top: remove `stored` with `cleanupStored()` when `rejected` is not empty. See [Many files per entity](#many-files-per-entity-with-a-maximum).
+- An adapter that needs a profile or `$subdir` per file, or a flow of its own, such as stopping at the first rejection, loops over `storeUpload()` instead.
 
 ### `UploadedFiles`
 
@@ -421,7 +443,7 @@ Returns end-user text for a rejection. It takes the exception or its reason. The
 
 ## Result format
 
-`storeUpload()` and `storeLocal()` return the same shape, with the keys in this order. The example is an avatar stored with the `avatar` profile below the user's opaque upload token:
+`storeUpload()` and `storeLocal()` return the same shape, with the keys in this order, and `storeUploads()` returns a list of them under `stored`. The example is an avatar stored with the `avatar` profile below the user's opaque upload token:
 
 ```php
 [
@@ -480,14 +502,14 @@ Returns end-user text for a rejection. It takes the exception or its reason. The
                                       citomni/image could not publish.
 
 \InvalidArgumentException             Developer misuse: an invalid or empty path, an invalid
-                                      $subdir, an unknown variant, a malformed $file, a file not
-                                      uploaded in the current request, or a local source that is
-                                      not a readable regular file.
+                                      $subdir, an unknown variant, a malformed $file or store
+                                      result, a file not uploaded in the current request, or a
+                                      local source that is not a readable regular file.
 ```
 
 The Upload exceptions live in `CitOmni\Upload\Exception`.
 
-- Adapters catch `UploadRejectedException` and nothing else. Catching `UploadException` would hide configuration and server faults behind a validation message.
+- Adapters catch `UploadRejectedException` and nothing else. Catching `UploadException` would hide configuration and server faults behind a validation message. `storeUploads()` returns its rejections instead of throwing them; everything else propagates as from `storeUpload()`.
 - Every other exception, including `\InvalidArgumentException` and `citomni/image`'s `ImageCapabilityException`, is a fault for the error handler.
 - `UploadConfigException` messages name the profile or the configuration key.
 - `UploadRejectedException` carries `public readonly UploadRejection $reason` and `public readonly array $context`. Its message (`Upload rejected: {reason}`) is meant for logs. A rejected call leaves no file in storage.
@@ -560,7 +582,7 @@ Upload calls `citomni/image` only when the profile has an `image` block **and** 
 
 ### Compensation
 
-When a store call fails, every file it created is removed before the exception propagates: Upload's own files, temporary files included, and `citomni/image`'s outputs, which means all of them after a successful `save()` and exactly those in `committed()` after a failed publish. Removal is keyed by output name and uses the paths Upload chose, so Upload never removes a path it did not name. It is best effort: a file the filesystem refuses to unlink stays and is logged when `log` is registered. `citomni/image` removes its own temporary files; whatever a crash leaves behind is removed by the sweep job in the [deployment checklist](#deployment-checklist).
+When a store call fails, every file it created is removed before the exception propagates: Upload's own files, temporary files included, and `citomni/image`'s outputs, which means all of them after a successful `save()` and exactly those in `committed()` after a failed publish. For `storeUploads()`, that includes every file of the entries the batch stored before the failure. Removal is keyed by output name and uses the paths Upload chose, so Upload never removes a path it did not name. It is best effort: a file the filesystem refuses to unlink stays and is logged when `log` is registered. `citomni/image` removes its own temporary files; whatever a crash leaves behind is removed by the sweep job in the [deployment checklist](#deployment-checklist).
 
 Upload decodes nothing, reads no pixel or EXIF data, adds no temporary-file layer around `save()`, and runs no capability probes. `capabilities()` is a deployment and diagnostics tool, not part of the pipeline.
 
@@ -654,11 +676,11 @@ anything else → bin
 
 ## Deleting files and deriving paths
 
-All seven methods validate every path against the [path rules](#path-rules) before any filesystem call, and `''` is invalid as a file path. One invalid path means that nothing is deleted. Invalid paths throw `\InvalidArgumentException`.
+All eight methods validate every path against the [path rules](#path-rules) before any filesystem call, and `''` is invalid as a file path. One invalid path means that nothing is deleted. Invalid paths throw `\InvalidArgumentException`.
 
 ### `delete*()` and `cleanup*()`
 
-| | `delete()`, `deleteWithVariants()` | `cleanup()`, `cleanupWithVariants()` |
+| | `delete()`, `deleteWithVariants()` | `cleanup()`, `cleanupWithVariants()`, `cleanupStored()` |
 |---|---|---|
 | Use when | Deleting is the task itself and must have happened before anything else is recorded | Removing files after a decision that is already committed |
 | Missing file | Counts as deleted | Counts as removed |
@@ -666,16 +688,17 @@ All seven methods validate every path against the [path rules](#path-rules) befo
 | The path names a directory | `UploadStorageException` | `false` and a log entry |
 | A link survives a refused unlink | Not gone, even when its target is missing | Not gone |
 | Returns | `void`: the files are gone, or it throws | `bool`: `true` when every file is gone |
-| Invalid or empty path | `\InvalidArgumentException` before any IO | `\InvalidArgumentException` before any IO |
-| Unknown storage or missing root | `UploadConfigException` | `UploadConfigException` |
-| No paths | Checks the root, then does nothing | Checks the root, then returns `true` |
-| Order | As given; `*WithVariants()`: the variants in profile order, then the main file | The same |
+| Invalid or empty path | `\InvalidArgumentException` before any IO | `\InvalidArgumentException` before any IO, also for a malformed store result |
+| Unknown storage or missing root | `UploadConfigException` | `UploadConfigException`; `cleanupStored()` checks every result's storage before it removes anything |
+| No paths | Checks the root, then does nothing | Checks the root, then returns `true`; `cleanupStored()` without results returns `true` |
+| Order | As given; `*WithVariants()`: the variants in profile order, then the main file | The same; `cleanupStored()`: per result, its variants in result order, then its main file |
 | A file fails | Stops and throws | Attempts every path |
 | Log context | – | `storage`, `path` (absolute), `stored_path` (the file's own relative path), `error` |
 
 Rule of thumb: when removing the file comes after a database commit, it is cleanup. That covers compensating a failed persistence, the old file after a replacement, and the file of an attachment the user deleted. When removing the file is the action itself and must have happened before the database is marked, it is delete. A retention purge, for example, deletes strictly and then marks the record as purged, so a failure leads to a retry instead of a record that lies.
 
 - `*WithVariants()` derives the variant paths from the main path and the profile's variant formats and removes the variants before the main file. The main file stays the anchor: an interrupted deletion never leaves variants without their main file, and a retry derives the same paths. A profile without an `image` block covers the main file only. For a non-image file stored with an image profile, the derived variant paths do not exist and count as removed.
+- `cleanupStored(...$stored)` removes exactly the files that store results list, each from its result's own storage: per result every `variants` path, then `path`. It needs neither the profile nor the image service, so a profile change since the store does not matter. It is meant for results that were never committed: compensating a failed persistence, or discarding an all-or-nothing batch with `cleanupStored(...$batch['stored'])`. A path read back from a record goes through `cleanup()` or `cleanupWithVariants()`. A result without a string `storage`, a string `path`, or a `variants` array with string paths throws `\InvalidArgumentException` before any filesystem call.
 - `cleanup*()` never throws on filesystem failures, so it is safe in `finally` blocks with paths from a store result. It still throws on invalid paths, which signal a broken invariant such as a malformed stored value, on an unknown storage or a missing root, and, for an image profile, when the image service is missing.
 - Deletion removes files, never directories; empty shard directories remain.
 - With the `log` service registered, cleanup failures are written with `$this->app->log->write('upload.jsonl', 'cleanup', $message, $context)`. The same goes for a store call's own compensation (context `storage` and `path`) and for a `$move` source that could not be removed (`path` is the source, and `stored_path` is the stored file). `error` comes from `error_get_last()`, best effort. A failing log is swallowed, because cleanup often runs while another exception is in flight.
@@ -729,7 +752,7 @@ final class ReplaceAvatar extends BaseOperation {
 			$swapped = true;
 		} finally {
 			if (!$swapped) {
-				$this->app->upload->cleanupWithVariants($stored['path'], 'avatar');
+				$this->app->upload->cleanupStored($stored);
 			}
 		}
 
@@ -761,42 +784,36 @@ final class UserProfileRepository extends BaseRepository {
 }
 ```
 
-`cleanupWithVariants()` is best effort, so neither the compensation nor the removal after the commit needs a `try`/`catch`. A removal that fails after the commit is logged by Upload, and the action succeeds. The thumbnail path follows from `variantPath($path, 'thumb', 'avatar')`; applications that prefer a thumbnail column persist `$stored['variants']['thumb']['path']`.
+`cleanupStored()` and `cleanupWithVariants()` are best effort, so neither the compensation nor the removal after the commit needs a `try`/`catch`. The compensation removes exactly the files of the fresh result; the previous files are derived from the persisted path and the profile. A removal that fails after the commit is logged by Upload, and the action succeeds. The thumbnail path follows from `variantPath($path, 'thumb', 'avatar')`; applications that prefer a thumbnail column persist `$stored['variants']['thumb']['path']`.
 
 ### Many files per entity, with a maximum
 
 - **Pre-check (UX).** The adapter may refuse a batch when existing plus incoming files exceed the limit, before any file is processed.
 - **Authoritative check.** The Repository locks the parent row, counts, and inserts in one transaction. It returns `null` when the limit would be exceeded.
-- **Batch policy.** All-or-nothing or partial acceptance is the application's choice; the Upload service handles one file per call.
+- **Batch policy.** All-or-nothing or partial acceptance is the application's choice. `storeUploads()` stores every acceptable file and reports the rest; the policy decides what happens with what was stored.
 
 An all-or-nothing adapter:
 
 ```php
 // Controller action body (illustrative), with the imports of the Quick start controller.
-$files = UploadedFiles::many($_FILES['attachments'] ?? null);
-$stored = [];
-$complete = false;
+$batch = $this->app->upload->storeUploads(UploadedFiles::many($_FILES['attachments'] ?? null), 'attachment', (string)$ownerId);
 
-try {
-	foreach ($files as $file) {
-		$stored[] = $this->app->upload->storeUpload($file, 'attachment', (string)$ownerId);
+if ($batch['rejected'] !== []) {
+	// All or nothing: the files that were accepted must not linger.
+	$this->app->upload->cleanupStored(...$batch['stored']);
+
+	$messages = [];
+	foreach ($batch['rejected'] as $e) {
+		$messages[] = $e->context['original_name'] . ': ' . $this->app->upload->rejectionMessage($e);
 	}
-	$complete = true;
-} catch (UploadRejectedException $e) {
-	$message = $this->app->upload->rejectionMessage($e);
-	// Render the form with $message (app-specific).
+	// Render the form with $messages (app-specific).
 	return;
-} finally {
-	if (!$complete) {
-		// A rejection or a fault part-way: the files stored so far must not linger.
-		foreach ($stored as $entry) {
-			$this->app->upload->cleanupWithVariants($entry['path'], 'attachment');
-		}
-	}
 }
 
-$result = (new AddAttachments($this->app))->execute($ownerId, $stored);
+$result = (new AddAttachments($this->app))->execute($ownerId, $batch['stored']);
 ```
+
+For partial acceptance, the adapter skips the early return: it passes `$batch['stored']` on and shows the messages for `$batch['rejected']` with the outcome.
 
 ```php
 final class AddAttachments extends BaseOperation {
@@ -811,7 +828,7 @@ final class AddAttachments extends BaseOperation {
 	 * - When nothing is persisted, the stored files are removed (best effort).
 	 *
 	 * @param  int                        $ownerId      Owning entity.
-	 * @param  list<array<string,mixed>>  $storedFiles  Results from Upload::storeUpload() or Upload::storeLocal().
+	 * @param  list<array<string,mixed>>  $storedFiles  Store results, e.g. Upload::storeUploads()['stored'].
 	 * @return array{ok:bool, reason:?string, ids:list<int>}  Outcome and the new ids.
 	 */
 	public function execute(int $ownerId, array $storedFiles): array {
@@ -823,15 +840,37 @@ final class AddAttachments extends BaseOperation {
 		} finally {
 			if ($ids === null) {
 				// Limit exceeded or persistence failed: the stored files must not linger.
-				foreach ($storedFiles as $stored) {
-					$this->app->upload->cleanupWithVariants($stored['path'], 'attachment');
-				}
+				$this->app->upload->cleanupStored(...$storedFiles);
 			}
 		}
 
 		return $ids === null
 			? ['ok' => false, 'reason' => 'limit_exceeded', 'ids' => []]
 			: ['ok' => true, 'reason' => null, 'ids' => $ids];
+	}
+}
+```
+
+`storeUploads()` is a convenience, not a requirement. An adapter with a flow of its own, such as a profile per file or stopping at the first rejection, loops over `storeUpload()` and compensates with `cleanupStored()`:
+
+```php
+// Stops at the first rejection, so nothing after it is processed.
+$stored = [];
+$complete = false;
+
+try {
+	foreach (UploadedFiles::many($_FILES['attachments'] ?? null) as $file) {
+		$stored[] = $this->app->upload->storeUpload($file, 'attachment', (string)$ownerId);
+	}
+	$complete = true;
+} catch (UploadRejectedException $e) {
+	$message = $this->app->upload->rejectionMessage($e);
+	// Render the form with $message (app-specific).
+	return;
+} finally {
+	if (!$complete) {
+		// A rejection or a fault part-way: the files stored so far must not linger.
+		$this->app->upload->cleanupStored(...$stored);
 	}
 }
 ```
@@ -1002,13 +1041,13 @@ Run one script with `php tests/storage_test.php`.
 |---|---|
 | `util_test.php` | `StoragePath`, `OriginalName`, `MimeMap`, `UploadRejection`, and the exception hierarchy |
 | `profile_test.php` | Every profile rule, the Registry baseline, memoization, inline profiles, and merge semantics |
-| `intake_test.php` | `UploadedFiles`, error-code mapping, check order, provenance, `rejectionMessage()`, and the language files |
+| `intake_test.php` | `UploadedFiles`, error-code mapping, check order, provenance, `storeUploads()` without HTTP, `rejectionMessage()`, and the language files |
 | `storage_test.php` | Generic validation, plain writes, the result, routing, `$move`, and compensation |
 | `image_path_test.php` | The image path against a scripted `citomni/image` double: outputs, order, result fields, exception translation, and compensation |
 | `image_integration_test.php` | The real `citomni/image`: `finfo` against `inspect()` on crafted headers, and the happy path with GD |
-| `delete_test.php` | `delete*()` and `cleanup*()` on an in-memory storage and on the real filesystem |
+| `delete_test.php` | `delete*()` and `cleanup*()`, `cleanupStored()` included, on an in-memory storage and on the real filesystem |
 | `read_path_test.php` | `variantPath()`, `absolutePath()`, `webPath()`, and proof that they do no IO |
-| `http_upload_test.php` | End to end through PHP's built-in web server: `$_FILES` shapes, `storeUpload()` with real uploads and error codes, and image uploads |
+| `http_upload_test.php` | End to end through PHP's built-in web server: `$_FILES` shapes, `storeUpload()` with real uploads and error codes, image uploads, and `storeUploads()` batches with partial acceptance and compensation |
 
 The scripts require PHP 8.5, `ext-fileinfo`, and `ext-mbstring`, and the image checks require `ext-gd`. Every unsuppressed diagnostic fails a run, including deprecations and `#[\NoDiscard]` warnings. Failures are forced through the filesystem or through stream wrappers in `tests/Support/`; the production code has no test seams.
 
@@ -1021,7 +1060,7 @@ Checks the platform cannot support print a `SKIP:` line instead of failing:
 
 ### Mutation testing
 
-`tests/mutation/` holds a mutation runner and 68 mutants in the areas `profile`, `store`, `intake`, `image`, `delete`, and `path`. It is not part of `composer test`.
+`tests/mutation/` holds a mutation runner and 84 mutants in the areas `profile`, `store`, `intake`, `batch`, `image`, `delete`, and `path`. It is not part of `composer test`.
 
 ```bash
 php tests/mutation/run.php            # All mutants.
@@ -1032,7 +1071,7 @@ php tests/mutation/run.php --list     # Validate the definitions and list them.
 - Every definition is validated before anything runs, also with a filter: each search string must occur exactly once, and the mutated file must parse.
 - The runner works in a temporary copy of the package with the sibling `kernel` and `image` sources and never modifies the working tree. Each affected script first runs without a mutation; a failing baseline stops the run and keeps the copy for inspection.
 - Exit code `0` means that every mutant that ran was killed, `1` that at least one survived, and `2` invalid definitions, a missing sibling package, or a failing baseline.
-- Run it where the suite normally runs, with `ext-gd`, as a non-root POSIX user: four mutants are killed only by a refused unlink and are skipped as root. There is no timeout.
+- Run it where the suite normally runs, with `ext-gd`, as a non-root POSIX user: five mutants are killed only by a refused unlink and are skipped as root. There is no timeout.
 
 ---
 

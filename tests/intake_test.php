@@ -19,8 +19,10 @@ declare(strict_types=1);
  * $path, full_path, empty slots) and of malformed or shape-confused entries;
  * storeUpload() up to and including its provenance check (developer and
  * configuration errors first, every UPLOAD_ERR_* code, no fallback for files
- * that were not uploaded); rejectionMessage() in both forms, with and without
- * the txt service; and the shipped language files.
+ * that were not uploaded); storeUploads() in the same scope (the same checks
+ * first, also for an empty list, collected rejections, faults that propagate,
+ * and #[\NoDiscard]); rejectionMessage() in both forms, with and without the
+ * txt service; and the shipped language files.
  *
  * is_uploaded_file() is false outside an HTTP upload, so everything past the
  * provenance check is covered by http_upload_test.php.
@@ -237,6 +239,37 @@ expectThrows(\InvalidArgumentException::class, static fn() => $upload->storeUplo
 
 check(\scandir($root) === ['.', '..'], 'storeUpload() wrote nothing outside an HTTP upload');
 check(!\in_array('image', $app->touched, true) && !\in_array('txt', $app->touched, true), 'storeUpload() resolves neither image nor txt');
+
+// -- storeUploads(): the same checks first, rejections collected ----------------------------
+
+check($upload->storeUploads([], $profile) === ['stored' => [], 'rejected' => []], 'storeUploads() of an empty list stores and rejects nothing');
+expectThrows(UploadConfigException::class, static fn() => $upload->storeUploads([], 'undefined'), 'an undefined profile is reported for an empty list too');
+expectThrows(\InvalidArgumentException::class, static fn() => $upload->storeUploads([], $profile, '../x'), 'an invalid $subdir is reported for an empty list too');
+expectThrows(UploadConfigException::class, static fn() => $upload->storeUploads([], ['storage' => 'gone'] + $profile), 'a missing storage root is reported for an empty list too');
+expectThrows(UploadConfigException::class, static fn() => $badModes->storeUploads([], $profile), 'an invalid file_mode is reported for an empty list too');
+
+$batch = $upload->storeUploads([$entry(\UPLOAD_ERR_PARTIAL, '', 'a.pdf'), $entry(\UPLOAD_ERR_INI_SIZE, '', 'b.pdf'), $entry(\UPLOAD_ERR_NO_FILE)], $profile);
+check(
+	$batch['stored'] === [] && \array_map(static fn(UploadRejectedException $e): UploadRejection => $e->reason, $batch['rejected']) === [UploadRejection::Partial, UploadRejection::TooLarge, UploadRejection::NoFile],
+	'storeUploads() collects every rejection, in order, instead of stopping at the first'
+);
+check($batch['rejected'][0]->context === ['original_name' => 'a.pdf', 'upload_error' => \UPLOAD_ERR_PARTIAL], 'a collected rejection is the exception storeUpload() throws, with its context');
+
+$e = expectThrows(UploadStorageException::class, static fn() => $upload->storeUploads([$entry(\UPLOAD_ERR_PARTIAL), $entry(\UPLOAD_ERR_CANT_WRITE), $entry(\UPLOAD_ERR_PARTIAL)], $profile), 'a server fault in a batch is not a rejection');
+check(\str_contains($e->getMessage(), 'UPLOAD_ERR_CANT_WRITE'), 'the server fault propagates unchanged and ends the batch');
+expectThrows(\InvalidArgumentException::class, static fn() => $upload->storeUploads([$entry(\UPLOAD_ERR_PARTIAL), []], $profile), 'a malformed entry in a batch is a developer error');
+expectThrows(\InvalidArgumentException::class, static fn() => $upload->storeUploads([$entry(\UPLOAD_ERR_PARTIAL), null], $profile), 'an entry that is not an array is the same developer error, not a TypeError');
+expectThrows(\InvalidArgumentException::class, static fn() => $upload->storeUploads([[]], ['storage' => 'gone'] + $profile), 'every entry is checked before the storage root, in storeUpload()\'s order');
+$e = expectThrows(\InvalidArgumentException::class, static fn() => $upload->storeUploads($entry(\UPLOAD_ERR_OK, $local, 'local.pdf'), $profile), 'a single entry instead of a list');
+check(\str_contains($e->getMessage(), 'UploadedFiles::many()') && \str_contains($e->getMessage(), 'storeUpload()'), 'the message points to UploadedFiles::many() and, for one entry, to storeUpload()');
+expectThrows(\InvalidArgumentException::class, static fn() => $upload->storeUploads([$entry(\UPLOAD_ERR_OK, $local, 'local.pdf')], $profile), 'a local file in a batch is not an upload');
+check(\scandir($root) === ['.', '..'] && \file_get_contents($local) === Fixtures::pdf(), 'storeUploads() wrote nothing outside an HTTP upload, and the local file is untouched');
+
+$e = expectThrows(\ErrorException::class, static function () use ($upload, $profile): void {
+	$upload->storeUploads([], $profile);
+}, 'ignoring the result of storeUploads()');
+check(\str_contains($e->getMessage(), 'storeUploads()'), 'storeUploads() is #[\\NoDiscard]: ignoring its result raises the warning');
+check(!\in_array('image', $app->touched, true) && !\in_array('txt', $app->touched, true), 'storeUploads() resolves neither image nor txt');
 
 // -- rejectionMessage() ---------------------------------------------------------------------
 

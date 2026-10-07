@@ -390,8 +390,8 @@ return [
 		'file' => 'src/Service/Upload.php',
 		'edits' => [
 			[
-				"\t\t\$this->storageRoot(\$resolved['storage']);\n\t\t\$this->modes();\n",
-				"",
+				"\t\t// Storage configuration fails fast, before any user-side upload error is reported.\n\t\t\$this->storageRoot(\$resolved['storage']);\n\t\t\$this->modes();\n",
+				"\t\t// Storage configuration fails fast, before any user-side upload error is reported.\n",
 			],
 		],
 		'tests' => ['intake', 'http_upload', 'storage'],
@@ -486,6 +486,225 @@ return [
 			],
 		],
 		'tests' => ['intake', 'http_upload', 'storage'],
+	],
+
+	// -- Batches: storeUploads() and cleanupStored() ----------------------------------
+
+	[
+		'id' => 'batch-01',
+		'label' => 'no compensation for earlier entries',
+		'file' => 'src/Service/Upload.php',
+		'edits' => [
+			[
+				"\t\t\t\t// A failure part-way: the files of earlier entries must not linger.\n\t\t\t\t\$this->discardResults(\$stored, \$resolved['storage'], \$root);\n",
+				"\t\t\t\t// A failure part-way: the files of earlier entries must not linger.\n",
+			],
+		],
+		'tests' => ['http_upload'],
+	],
+
+	[
+		'id' => 'batch-02',
+		'label' => 'every exception collected as a rejection',
+		'file' => 'src/Service/Upload.php',
+		'edits' => [
+			[
+				"\t\t\t\t} catch (UploadRejectedException \$e) {\n\t\t\t\t\t\$rejected[] = \$e;",
+				"\t\t\t\t} catch (\\Throwable \$e) {\n\t\t\t\t\t\$rejected[] = \$e;",
+			],
+		],
+		'tests' => ['intake', 'http_upload'],
+	],
+
+	[
+		'id' => 'batch-03',
+		'label' => 'batch stops at the first rejection',
+		'file' => 'src/Service/Upload.php',
+		'edits' => [
+			[
+				"\t\t\t\t\t\$rejected[] = \$e;\n",
+				"\t\t\t\t\t\$rejected[] = \$e;\n\t\t\t\t\tbreak;\n",
+			],
+		],
+		'tests' => ['intake', 'http_upload'],
+	],
+
+	[
+		'id' => 'batch-04',
+		'label' => 'empty batch returns before the upfront checks',
+		'file' => 'src/Service/Upload.php',
+		'edits' => [
+			[
+				"\t\t\$resolved = \$this->resolveProfile(\$profile);\n\t\tStoragePath::validateRelative(\$subdir);\n\n\t\tforeach (\$files as \$file) {",
+				"\t\tif (\$files === []) {\n\t\t\treturn ['stored' => [], 'rejected' => []];\n\t\t}\n\n\t\t\$resolved = \$this->resolveProfile(\$profile);\n\t\tStoragePath::validateRelative(\$subdir);\n\n\t\tforeach (\$files as \$file) {",
+			],
+		],
+		'tests' => ['intake'],
+	],
+
+	[
+		'id' => 'batch-05',
+		'label' => 'empty batch skips the storage preconditions',
+		'file' => 'src/Service/Upload.php',
+		'edits' => [
+			[
+				"\t\t\$root = \$this->storageRoot(\$resolved['storage']);\n\t\t\$this->modes();\n",
+				"\t\t\$root = \$files === [] ? '' : \$this->storageRoot(\$resolved['storage']);\n\n\t\tif (\$files !== []) {\n\t\t\t\$this->modes();\n\t\t}\n",
+			],
+		],
+		'tests' => ['intake'],
+	],
+
+	[
+		'id' => 'batch-15',
+		'label' => 'entries checked only when they are reached',
+		'file' => 'src/Service/Upload.php',
+		'edits' => [
+			[
+				"\t\t\tif (!\\is_array(\$file) || !\\is_string(\$file['name'] ?? null) || !\\is_string(\$file['tmp_name'] ?? null) || !\\is_int(\$file['error'] ?? null)) {",
+				"\t\t\tif (false) {",
+			],
+		],
+		'tests' => ['intake', 'http_upload'],
+	],
+
+	[
+		'id' => 'batch-06',
+		'label' => 'storeUploads() result may be ignored',
+		'file' => 'src/Service/Upload.php',
+		'edits' => [
+			[
+				"\t#[\\NoDiscard]\n\tpublic function storeUploads(",
+				"\tpublic function storeUploads(",
+			],
+		],
+		'tests' => ['intake'],
+	],
+
+	[
+		'id' => 'batch-07',
+		'label' => 'batch compensation ignores variants',
+		'file' => 'src/Service/Upload.php',
+		'edits' => [
+			[
+				"\t\t\tforeach (\$result['variants'] as \$variant) {\n\t\t\t\t\$paths[] = self::absolute(\$root, \$variant['path']);\n\t\t\t}\n\n",
+				"",
+			],
+		],
+		'tests' => ['http_upload'],
+	],
+
+	[
+		'id' => 'batch-16',
+		'label' => 'batch compensation does not log refused removals',
+		'file' => 'src/Service/Upload.php',
+		'edits' => [
+			[
+				"\t\t\$this->discard(\$paths, \$storage);\n",
+				"\t\tforeach (\$paths as \$path) {\n\t\t\t@\\unlink(\$path);\n\t\t}\n",
+			],
+		],
+		'tests' => ['http_upload'],
+		'unprivileged' => true,
+	],
+
+	[
+		'id' => 'batch-08',
+		'label' => 'cleanupStored() short-circuits after a failure',
+		'file' => 'src/Service/Upload.php',
+		'edits' => [
+			[
+				"\$gone = \$this->cleanupFiles(\$storage, \$this->storageRoot(\$storage), \$paths) && \$gone;",
+				"\$gone = \$gone && \$this->cleanupFiles(\$storage, \$this->storageRoot(\$storage), \$paths);",
+			],
+		],
+		'tests' => ['delete'],
+	],
+
+	[
+		'id' => 'batch-09',
+		'label' => 'cleanupStored() ignores variants',
+		'file' => 'src/Service/Upload.php',
+		'edits' => [
+			[
+				"\t\t\t\t\$paths[] = \$variant['path'];\n",
+				"",
+			],
+		],
+		'tests' => ['delete'],
+	],
+
+	[
+		'id' => 'batch-10',
+		'label' => 'cleanupStored() removes the main file first',
+		'file' => 'src/Service/Upload.php',
+		'edits' => [
+			[
+				"\t\t\t\$paths[] = \$path;\n\t\t\t\$jobs[] = [\$storage, self::filePaths(\$paths)];",
+				"\t\t\t\\array_unshift(\$paths, \$path);\n\t\t\t\$jobs[] = [\$storage, self::filePaths(\$paths)];",
+			],
+		],
+		'tests' => ['delete'],
+	],
+
+	[
+		'id' => 'batch-11',
+		'label' => 'cleanupStored() accepts a result without variants',
+		'file' => 'src/Service/Upload.php',
+		'edits' => [
+			[
+				"\$variants = \$result['variants'] ?? null;",
+				"\$variants = \$result['variants'] ?? [];",
+			],
+			[
+				" || !\\is_string(\$path) || !\\is_array(\$variants)) {",
+				" || !\\is_string(\$path)) {",
+			],
+		],
+		'tests' => ['delete'],
+	],
+
+	[
+		'id' => 'batch-12',
+		'label' => 'cleanupStored() verifies roots while removing',
+		'file' => 'src/Service/Upload.php',
+		'edits' => [
+			[
+				"\t\t// Every root is verified before the first file of any result is removed.\n\t\tforeach (\$jobs as [\$storage]) {\n\t\t\t\$this->storageRoot(\$storage);\n\t\t}\n\n",
+				"",
+			],
+		],
+		'tests' => ['delete'],
+	],
+
+	[
+		'id' => 'batch-13',
+		'label' => 'cleanupStored() touches a root before validating every result',
+		'file' => 'src/Service/Upload.php',
+		'edits' => [
+			[
+				"\t\t\t\$jobs[] = [\$storage, self::filePaths(\$paths)];",
+				"\t\t\t\$this->storageRoot(\$storage);\n\t\t\t\$jobs[] = [\$storage, self::filePaths(\$paths)];",
+			],
+		],
+		'tests' => ['delete'],
+	],
+
+	[
+		'id' => 'batch-14',
+		'label' => 'cleanupStored() skips the root check',
+		'file' => 'src/Service/Upload.php',
+		'edits' => [
+			[
+				"\t\t\t\$this->storageRoot(\$storage);\n\t\t}",
+				"\t\t\t\$this->configuredRoot(\$storage);\n\t\t}",
+			],
+			[
+				"\$gone = \$this->cleanupFiles(\$storage, \$this->storageRoot(\$storage), \$paths) && \$gone;",
+				"\$gone = \$this->cleanupFiles(\$storage, \$this->configuredRoot(\$storage), \$paths) && \$gone;",
+			],
+		],
+		'tests' => ['delete'],
 	],
 
 	// -- Image path -------------------------------------------------------------------
