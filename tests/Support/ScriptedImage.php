@@ -22,8 +22,8 @@ use CitOmni\Image\Exception\ImageTargetExistsException;
  * Scriptable double of citomni/image's Image service.
  *
  * Behavior:
- * - inspect() and save() have the real signatures; image_path_test.php checks
- *   them against Image with reflection, so the double cannot drift.
+ * - inspect() and save() have the real signatures; tests/image-path/run.php
+ *   checks them against Image with reflection, so the double cannot drift.
  * - Every call is recorded. save() also records whether every target
  *   directory existed at call time.
  * - inspect() returns $info, or the result of $onInspect.

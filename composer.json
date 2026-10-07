@@ -48,17 +48,7 @@
         }
     },
     "scripts": {
-        "test": [
-            "@php tests/util_test.php",
-            "@php tests/profile_test.php",
-            "@php tests/intake_test.php",
-            "@php tests/storage_test.php",
-            "@php tests/image_path_test.php",
-            "@php tests/image_integration_test.php",
-            "@php tests/delete_test.php",
-            "@php tests/read_path_test.php",
-            "@php tests/http_upload_test.php"
-        ]
+        "test": "@php tests/run.php"
     },
     "config": {
         "sort-packages": true

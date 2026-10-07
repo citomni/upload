@@ -13,8 +13,21 @@ declare(strict_types=1);
  * please see the LICENSE file distributed with this source code.
  */
 
+namespace CitOmni\Upload\Tests\HttpUpload;
+
+use CitOmni\Image\Boot\Registry as ImageRegistry;
+use CitOmni\Image\Exception\ImageCapabilityException;
+use CitOmni\Image\Service\Image;
+use CitOmni\Upload\Exception\UploadRejectedException;
+use CitOmni\Upload\Service\Upload;
+use CitOmni\Upload\Tests\Support\RecordingLog;
+use CitOmni\Upload\Tests\Support\ScriptedImage;
+use CitOmni\Upload\Tests\Support\TestApp;
+use CitOmni\Upload\Util\UploadedFiles;
+
 /*
- * Request router for tests/http_upload_test.php, run by PHP's built-in web server.
+ * Built-in web server router for tests/http-upload/run.php. Not a suite of its
+ * own; tests/run.php only collects run.php and database.php.
  *
  * "GET /?ping=1" answers {"pong":true}. A POST carries a JSON "spec" field and
  * file parts. Inside the request, where is_uploaded_file() and
@@ -43,21 +56,25 @@ declare(strict_types=1);
  * ImageCapabilityException on its n-th call, before it writes anything; with
  * spec.lock_on_fail, it first makes its target directory read-only (0555), so
  * the batch's compensation cannot remove what the batch stored there.
- * Test-only: the server is bound to 127.0.0.1 and lives as long as one test
- * script.
+ *
+ * Test-only: the server is bound to 127.0.0.1 and lives as long as one suite.
  */
 
-require __DIR__ . '/../bootstrap.php';
+if (\PHP_SAPI !== 'cli-server') {
+	throw new \RuntimeException('Built-in web server router only.');
+}
 
-use CitOmni\Image\Boot\Registry as ImageRegistry;
-use CitOmni\Image\Exception\ImageCapabilityException;
-use CitOmni\Image\Service\Image;
-use CitOmni\Upload\Exception\UploadRejectedException;
-use CitOmni\Upload\Service\Upload;
-use CitOmni\Upload\Tests\Support\RecordingLog;
-use CitOmni\Upload\Tests\Support\ScriptedImage;
-use CitOmni\Upload\Tests\Support\TestApp;
-use CitOmni\Upload\Util\UploadedFiles;
+// Fail fast on every diagnostic, including deprecations and #[\NoDiscard] warnings. Like the
+// production ErrorHandler, leave diagnostics silenced with @ to PHP, so error_get_last() works.
+\set_error_handler(static function (int $errno, string $errstr, string $errfile, int $errline): bool {
+	if ((\error_reporting() & $errno) === 0) {
+		return false;
+	}
+
+	throw new \ErrorException($errstr, 0, $errno, $errfile, $errline);
+});
+
+require \dirname(__DIR__) . '/bootstrap.php';
 
 \header('Content-Type: application/json');
 

@@ -14,25 +14,31 @@ declare(strict_types=1);
  */
 
 /*
- * Shared bootstrap for citomni/upload regression scripts.
+ * Shared bootstrap for the suites (tests/<suite>/run.php) and the built-in web
+ * server router (tests/http-upload/server.php). Not a suite of its own;
+ * tests/run.php only collects run.php and database.php.
  *
- * Run a script directly, e.g. `php tests/storage_test.php`, or all of them
- * with `composer test`. Scripts exit non-zero on the first failed check and
- * print a "SKIP:" line for every case the platform cannot force.
+ * A suite installs its CLI guard and its error handler, then requires this file
+ * instead of a Composer bootstrap. Every suite runs in its own process.
  *
  * Provides:
- * - A minimal BaseService double, defined before the Kernel's BaseService can
+ * - A minimal BaseService double, defined before the kernel's BaseService can
  *   be autoloaded, because the real one requires a full App, and an App needs
  *   citomni/http or citomni/cli.
  * - One PSR-4 autoloader: Upload's src/ and tests/, plus citomni/kernel and
  *   citomni/image from sibling packages (the development layout
  *   citomni/{kernel,image,upload}; vendor/citomni/* has the same shape).
- *   No Composer installation and no vendor/autoload.php is needed.
- * - An error handler that turns every unsuppressed PHP warning or notice
- *   into an exception. @-suppressed diagnostics are left to PHP, so
- *   error_get_last() works as in citomni/http.
- * - check(), expectThrows(), skip(), tempDir(), filesUnder(), testCfg(),
- *   testApp(), platform probes, and done() helpers.
+ * - CITOMNI_APP_PATH, pointing at a directory that never exists, so the
+ *   baseline storages of Registry::CFG_COMMON are unprovisioned.
+ * - The case runner: test() runs one named case and reports PASS, FAIL, or
+ *   SKIP; done() prints the totals and ends the suite with its exit code.
+ * - Assertions and helpers: check(), expectThrows(), requires(), tempDir(),
+ *   filesUnder(), testCfg(), testApp(), and platform probes.
+ *
+ * Notes:
+ * - Files a suite writes live below one run directory,
+ *   citomni_upload_<suite>_test_<random> under sys_get_temp_dir(), created on
+ *   first use and removed at shutdown. Nothing else is ever removed.
  */
 
 namespace CitOmni\Kernel\Service {
@@ -73,7 +79,17 @@ namespace {
 	use CitOmni\Upload\Tests\Support\TestApp;
 
 
-	/** Report a fatal setup problem on STDERR (CLI) or the response (web runner). */
+	/** A failed check: the case fails with the check's message. */
+	final class CheckFailed extends \RuntimeException {
+	}
+
+
+	/** A case the platform cannot run: it is reported as SKIP with the reason. */
+	final class CaseSkipped extends \RuntimeException {
+	}
+
+
+	/** Report a fatal setup problem on STDERR (CLI) or the response (web server router) and stop. */
 	function fail(string $message): never {
 		\defined('STDERR') ? \fwrite(\STDERR, $message . "\n") : print($message . "\n");
 		exit(1);
@@ -98,7 +114,7 @@ namespace {
 	foreach ($uploadTestSiblings as $uploadTestDirectory) {
 		if (!\is_dir($uploadTestDirectory)) {
 			fail(
-				"Sibling packages not found. The tests load citomni/kernel and citomni/image from the layout citomni/{kernel,image,upload}.\n"
+				"Sibling packages not found. The suites load citomni/kernel and citomni/image from the layout citomni/{kernel,image,upload}.\n"
 				. "Looked for:\n  " . \implode("\n  ", $uploadTestSiblings)
 			);
 		}
@@ -125,32 +141,88 @@ namespace {
 
 	unset($uploadTestExtension, $uploadTestSiblings, $uploadTestDirectory);
 
-	// Fail on any unsuppressed diagnostic, including deprecations and #[\NoDiscard] warnings.
-	\set_error_handler(static function (int $errno, string $message, string $file, int $line): bool {
-		if ((\error_reporting() & $errno) === 0) {
-			return false;
-		}
-
-		throw new \ErrorException($message, 0, $errno, $file, $line);
-	});
+	// The run directory of this suite; the suite is the directory of the script PHP started.
+	\define('UPLOAD_TEST_RUN_DIR', \sys_get_temp_dir() . '/citomni_upload_' . \basename(\dirname(\get_included_files()[0])) . '_test_' . \bin2hex(\random_bytes(6)));
 
 	// Registry::CFG_COMMON derives the baseline roots from CITOMNI_APP_PATH. It points
-	// at a directory that does not exist, so the baseline storages are unprovisioned.
+	// at a directory that is never created, so the baseline storages are unprovisioned.
 	if (!\defined('CITOMNI_APP_PATH')) {
-		\define('CITOMNI_APP_PATH', \sys_get_temp_dir() . '/citomni-upload-test-app-' . \bin2hex(\random_bytes(6)));
+		\define('CITOMNI_APP_PATH', \UPLOAD_TEST_RUN_DIR . '/app');
 	}
 
-	$checks = 0;
-	$skips = 0;
+	$passed = 0;
+	$failed = 0;
+	$skipped = 0;
 
 
-	/** Check a condition independently of zend.assertions. */
+	// ----------------------------------------------------------------
+	// Case runner
+	// ----------------------------------------------------------------
+
+	/**
+	 * Run one case and report it.
+	 *
+	 * Behavior:
+	 * - PASS <name> on stdout when the case returns.
+	 * - SKIP <name>: <reason> on stdout when the case calls requires() with a
+	 *   condition that does not hold.
+	 * - FAIL <name> - <reason> on stderr when a check fails or anything else is
+	 *   thrown. The suite goes on with the next case either way.
+	 *
+	 * @param string $name Case name, shown in the report.
+	 * @param \Closure $case The case; it sets up everything it needs itself.
+	 * @return void
+	 */
+	function test(string $name, \Closure $case): void {
+		global $passed, $failed, $skipped;
+
+		try {
+			$case();
+		} catch (CaseSkipped $e) {
+			++$skipped;
+			\fwrite(\STDOUT, "SKIP {$name}: {$e->getMessage()}\n");
+
+			return;
+		} catch (CheckFailed $e) {
+			++$failed;
+			\fwrite(\STDERR, "FAIL {$name} - " . oneLine($e->getMessage()) . "\n");
+
+			return;
+		} catch (\Throwable $e) {
+			++$failed;
+			\fwrite(\STDERR, "FAIL {$name} - " . oneLine($e::class . ': ' . $e->getMessage() . ' at ' . \basename($e->getFile()) . ':' . $e->getLine()) . "\n");
+
+			return;
+		}
+
+		++$passed;
+		\fwrite(\STDOUT, "PASS {$name}\n");
+	}
+
+
+	/** Print the totals line and end the suite: exit code 0 when no case failed, 1 otherwise. */
+	function done(): never {
+		global $passed, $failed, $skipped;
+
+		\fwrite(\STDOUT, "{$passed} passed, {$failed} failed" . ($skipped > 0 ? ", {$skipped} skipped" : '') . "\n");
+		exit($failed === 0 ? 0 : 1);
+	}
+
+
+	/** Collapse line breaks, so a FAIL line stays on one line. */
+	function oneLine(string $text): string {
+		return \trim((string)\preg_replace('/\s*\R\s*/', ' | ', $text));
+	}
+
+
+	// ----------------------------------------------------------------
+	// Assertions
+	// ----------------------------------------------------------------
+
+	/** Fail the current case with $message unless $condition holds. */
 	function check(bool $condition, string $message): void {
-		global $checks;
-		++$checks;
-
 		if (!$condition) {
-			throw new \RuntimeException('FAILED: ' . $message);
+			throw new CheckFailed($message);
 		}
 	}
 
@@ -166,61 +238,89 @@ namespace {
 			$callback();
 		} catch (\Throwable $e) {
 			check($e instanceof $class, $message . ' (expected ' . $class . ', got ' . $e::class . ': ' . $e->getMessage() . ')');
+
 			return $e;
 		}
 
-		check(false, $message . ' (expected ' . $class . ', nothing thrown)');
-		throw new \LogicException('unreachable');
-	}
-
-
-	/** Report a case the current platform or user cannot force. */
-	function skip(string $case, string $reason): void {
-		global $skips;
-		++$skips;
-
-		echo 'SKIP: ' . $case . ' (' . $reason . ")\n";
+		throw new CheckFailed($message . ' (expected ' . $class . ', nothing thrown)');
 	}
 
 
 	/**
-	 * Create an empty temporary directory, removed at shutdown.
+	 * Skip the current case unless the platform can run it.
 	 *
-	 * Removal first restores write permission everywhere, because tests make
-	 * files and directories read-only on purpose.
+	 * Call it before the case's first check, so a skipped case has checked nothing.
+	 */
+	function requires(bool $condition, string $reason): void {
+		if (!$condition) {
+			throw new CaseSkipped($reason);
+		}
+	}
+
+
+	// ----------------------------------------------------------------
+	// Files and configuration
+	// ----------------------------------------------------------------
+
+	/**
+	 * Create an empty directory below the run directory.
+	 *
+	 * The run directory is created on first use and removed at shutdown. Removal
+	 * first restores write permission everywhere, because cases make files and
+	 * directories read-only on purpose.
 	 */
 	function tempDir(): string {
-		$dir = \sys_get_temp_dir() . '/citomni-upload-test-' . \bin2hex(\random_bytes(6));
+		static $count = 0;
 
-		if (!\mkdir($dir, 0777, true)) {
+		if ($count === 0) {
+			if (!\mkdir(\UPLOAD_TEST_RUN_DIR, 0777, true)) {
+				fail('Unable to create the run directory ' . \UPLOAD_TEST_RUN_DIR);
+			}
+
+			\register_shutdown_function(static function (): void {
+				removeRunDir(\UPLOAD_TEST_RUN_DIR);
+			});
+		}
+
+		$dir = \UPLOAD_TEST_RUN_DIR . '/' . ++$count;
+
+		if (!\mkdir($dir)) {
 			fail('Unable to create temp dir: ' . $dir);
 		}
 
-		\register_shutdown_function(static function () use ($dir): void {
-			@\chmod($dir, 0777);
+		return $dir;
+	}
 
-			$entries = new \RecursiveIteratorIterator(
-				new \RecursiveDirectoryIterator($dir, \FilesystemIterator::SKIP_DOTS),
-				\RecursiveIteratorIterator::SELF_FIRST
-			);
 
-			foreach ($entries as $entry) {
+	/** Remove the run directory, including everything below it. */
+	function removeRunDir(string $dir): void {
+		if (!\is_dir($dir)) {
+			return;
+		}
+
+		@\chmod($dir, 0777);
+
+		$entries = new \RecursiveIteratorIterator(
+			new \RecursiveDirectoryIterator($dir, \FilesystemIterator::SKIP_DOTS),
+			\RecursiveIteratorIterator::SELF_FIRST
+		);
+
+		foreach ($entries as $entry) {
+			if (!$entry->isLink()) {
 				@\chmod($entry->getPathname(), $entry->isDir() ? 0777 : 0666);
 			}
+		}
 
-			$entries = new \RecursiveIteratorIterator(
-				new \RecursiveDirectoryIterator($dir, \FilesystemIterator::SKIP_DOTS),
-				\RecursiveIteratorIterator::CHILD_FIRST
-			);
+		$entries = new \RecursiveIteratorIterator(
+			new \RecursiveDirectoryIterator($dir, \FilesystemIterator::SKIP_DOTS),
+			\RecursiveIteratorIterator::CHILD_FIRST
+		);
 
-			foreach ($entries as $entry) {
-				$entry->isDir() ? @\rmdir($entry->getPathname()) : @\unlink($entry->getPathname());
-			}
+		foreach ($entries as $entry) {
+			$entry->isDir() && !$entry->isLink() ? @\rmdir($entry->getPathname()) : @\unlink($entry->getPathname());
+		}
 
-			@\rmdir($dir);
-		});
-
-		return $dir;
+		@\rmdir($dir);
 	}
 
 
@@ -293,7 +393,11 @@ namespace {
 	}
 
 
-	/** Whether the tests run on Windows. */
+	// ----------------------------------------------------------------
+	// Platform probes
+	// ----------------------------------------------------------------
+
+	/** Whether the suites run on Windows. */
 	function isWindows(): bool {
 		return \PHP_OS_FAMILY === 'Windows';
 	}
@@ -372,12 +476,5 @@ namespace {
 		}
 
 		return $result;
-	}
-
-
-	/** Print the summary line for a script. */
-	function done(string $name): void {
-		global $checks, $skips;
-		echo $name . ': ' . $checks . ' checks passed' . ($skips > 0 ? ', ' . $skips . ' skipped' : '') . ".\n";
 	}
 }

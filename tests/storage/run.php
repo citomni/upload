@@ -1,0 +1,559 @@
+<?php
+declare(strict_types=1);
+/*
+ * This file is part of the CitOmni framework.
+ * Low overhead, high performance, ready for anything.
+ *
+ * For more information, visit https://github.com/citomni
+ *
+ * Copyright (c) 2012-present Lars Grove Mortensen
+ * SPDX-License-Identifier: MIT
+ *
+ * For full copyright, trademark, and license information,
+ * please see the LICENSE file distributed with this source code.
+ */
+
+namespace CitOmni\Upload\Tests\Storage;
+
+use CitOmni\Image\Enum\ImageFormat;
+use CitOmni\Upload\Enum\UploadRejection;
+use CitOmni\Upload\Exception\UploadConfigException;
+use CitOmni\Upload\Exception\UploadRejectedException;
+use CitOmni\Upload\Exception\UploadStorageException;
+use CitOmni\Upload\Service\Upload;
+use CitOmni\Upload\Tests\Support\FaultSource;
+use CitOmni\Upload\Tests\Support\Fixtures;
+use CitOmni\Upload\Tests\Support\RecordingLog;
+use CitOmni\Upload\Util\MimeMap;
+
+/*
+ * Isolated suite for the storage contract of storeLocal() on the plain path:
+ * generic validation before any write, source checks, placement (directory,
+ * $subdir, sharding, 32-hex names), storage roots, profile directory versus
+ * $subdir errors, file and directory modes, hashing, the result shape of a
+ * plain file, routing without touching the image service, $move semantics
+ * around the commit point, and compensation.
+ *
+ * Failures that cannot be arranged in advance are forced through the
+ * filesystem where the platform enforces permissions (otherwise SKIP), and
+ * through the test-only FaultSource stream wrapper where the target name or
+ * a mid-call state change is needed. Upload itself has no test seams.
+ *
+ * Usage:
+ *   php tests/storage/run.php
+ */
+
+if (\PHP_SAPI !== 'cli') {
+	throw new \RuntimeException('CLI only.');
+}
+
+// Fail fast on every diagnostic, including deprecations and #[\NoDiscard] warnings. Like the
+// production ErrorHandler, leave diagnostics silenced with @ to PHP, so error_get_last() works.
+\set_error_handler(static function (int $errno, string $errstr, string $errfile, int $errline): bool {
+	if ((\error_reporting() & $errno) === 0) {
+		return false;
+	}
+
+	throw new \ErrorException($errstr, 0, $errno, $errfile, $errline);
+});
+
+require \dirname(__DIR__) . '/bootstrap.php';
+
+$dir = tempDir();
+$sources = $dir . '/sources';
+\mkdir($sources);
+
+/** Write a source file and return its path. */
+$source = static function (string $name, string $bytes) use ($sources): string {
+	$path = $sources . '/' . $name;
+	\file_put_contents($path, $bytes);
+
+	return $path;
+};
+
+/**
+ * Create a fresh storage root and an Upload service whose "files" storage points at it.
+ *
+ * @return array{0: Upload, 1: string, 2: \CitOmni\Upload\Tests\Support\TestApp}
+ */
+$setup = static function (array $upload = [], array $services = []) use ($dir): array {
+	$root = $dir . '/root-' . \bin2hex(\random_bytes(4));
+	\mkdir($root);
+	$app = testApp(testCfg(['upload' => ['storages' => ['files' => ['root' => $root, 'web_path' => null]]] + $upload]), $services);
+
+	return [new Upload($app), $root, $app];
+};
+
+// Sources that no case modifies; cases that move or lock a source write their own.
+$text = $source('note.txt', "Hello, upload.\n");
+$pdf = $source('report.pdf', Fixtures::pdf());
+$jpeg = $source('photo.jpg', Fixtures::jpeg());
+$bmp = $source('pixel.bmp', Fixtures::bmp());
+$heif = $source('photo.heif', Fixtures::heif());
+$binary = $source('blob.dat', Fixtures::binary());
+$evil = $source('evil.jpg', Fixtures::php());
+$empty = $source('empty.txt', '');
+
+$textProfile = ['storage' => 'files', 'accept' => ['text/plain'], 'max_bytes' => 1000];
+$pdfProfile = ['storage' => 'files', 'accept' => ['application/pdf'], 'max_bytes' => 100_000];
+
+// A profile whose directory and shards would be created by a write; a rejection must create neither.
+$rejecting = ['directory' => 'never/created', 'shard' => 2] + $textProfile;
+
+// The three log setups of a failed cleanup: a log that records, a log that throws, and no log service.
+$logCases = ['recording' => null, 'throwing' => new \RuntimeException('log is down'), 'unregistered' => false];
+
+
+// -- 1. Generic validation --------------------------------------------------------------
+
+test('a zero-byte file is rejected as Empty with original_name and size, and nothing is written', static function () use ($setup, $empty, $rejecting): void {
+	[$upload, $root] = $setup();
+	$e = expectThrows(UploadRejectedException::class, static fn() => $upload->storeLocal($empty, $rejecting), 'a zero-byte file is rejected');
+	check($e->reason === UploadRejection::Empty && $e->context === ['original_name' => 'empty.txt', 'size' => 0], 'Empty carries original_name and size');
+	check(\scandir($root) === ['.', '..'], 'the rejection writes nothing and creates no directories');
+});
+
+test('a file above max_bytes is rejected as TooLarge with size and max_bytes, and nothing is written', static function () use ($setup, $source, $rejecting): void {
+	[$upload, $root] = $setup();
+	$eleven = $source('eleven.txt', \str_repeat('a', 11));
+	$e = expectThrows(UploadRejectedException::class, static fn() => $upload->storeLocal($eleven, ['max_bytes' => 10] + $rejecting), 'a file above max_bytes is rejected');
+	check($e->reason === UploadRejection::TooLarge && $e->context === ['original_name' => 'eleven.txt', 'size' => 11, 'max_bytes' => 10], 'TooLarge carries original_name, size, and max_bytes');
+	check(\scandir($root) === ['.', '..'], 'the rejection writes nothing and creates no directories');
+});
+
+test('a type outside accept is rejected as TypeNotAllowed with the detected type, and nothing is written', static function () use ($setup, $text, $rejecting): void {
+	[$upload, $root] = $setup();
+	$e = expectThrows(UploadRejectedException::class, static fn() => $upload->storeLocal($text, ['accept' => ['application/pdf']] + $rejecting), 'a type outside accept is rejected');
+	check($e->reason === UploadRejection::TypeNotAllowed && $e->context === ['original_name' => 'note.txt', 'size' => 15, 'mime' => 'text/plain'], 'TypeNotAllowed carries original_name, size, and the detected type');
+	check(\scandir($root) === ['.', '..'], 'the rejection writes nothing and creates no directories');
+});
+
+test('PHP code named .jpg is rejected by an image accept list: the type comes from the content', static function () use ($setup, $evil, $rejecting): void {
+	[$upload, $root] = $setup();
+	$e = expectThrows(UploadRejectedException::class, static fn() => $upload->storeLocal($evil, ['accept' => ['image/jpeg']] + $rejecting), 'PHP code named .jpg is rejected by an image accept list');
+	check($e->reason === UploadRejection::TypeNotAllowed && $e->context['mime'] !== 'image/jpeg', 'the type comes from the content, never from the name');
+	check(\scandir($root) === ['.', '..'], 'the rejection writes nothing and creates no directories');
+});
+
+test('a file of exactly max_bytes is accepted, and max_bytes null sets no service limit', static function () use ($setup, $source, $textProfile): void {
+	[$upload] = $setup();
+	$ten = $source('ten.txt', \str_repeat('a', 10));
+	check($upload->storeLocal($ten, ['max_bytes' => 10] + $textProfile)['size'] === 10, 'a file of exactly max_bytes is accepted');
+
+	$big = $source('big.txt', \str_repeat("lorem ipsum\n", 100_000));
+	check($upload->storeLocal($big, ['max_bytes' => null] + $textProfile)['size'] === 1_200_000, 'max_bytes null sets no service limit');
+});
+
+test("accept ['*'] takes any type, and an unknown type is stored as .bin", static function () use ($setup, $binary, $textProfile): void {
+	[$upload] = $setup();
+	$result = $upload->storeLocal($binary, ['accept' => ['*']] + $textProfile);
+	check($result['mime'] === 'application/octet-stream' && \str_ends_with($result['path'], '.bin'), "['*'] accepts any type, and an unknown type is stored as .bin");
+});
+
+test("PHP code accepted by ['*'] gets the extension of its detected type, never .php or .jpg", static function () use ($setup, $evil, $textProfile): void {
+	[$upload] = $setup();
+	$result = $upload->storeLocal($evil, ['accept' => ['*']] + $textProfile);
+	check(
+		$result['mime'] !== 'image/jpeg' && \str_ends_with($result['path'], '.' . MimeMap::extension($result['mime'])) && \preg_match('~\.(php|phtml|jpg)$~D', $result['path']) === 0,
+		"PHP code accepted by ['*'] gets the extension of its detected type, never .php or .jpg"
+	);
+});
+
+test('accept image/bmp or image/x-ms-bmp takes a BMP, stored as image/bmp whichever alias finfo reports', static function () use ($setup, $bmp, $textProfile): void {
+	[$upload] = $setup();
+
+	foreach (['image/bmp', 'image/x-ms-bmp'] as $accepted) {
+		$result = $upload->storeLocal($bmp, ['accept' => [$accepted]] + $textProfile);
+		check(
+			$result['mime'] === 'image/bmp' && $result['source_mime'] === 'image/bmp' && \str_ends_with($result['path'], '.bmp'),
+			"accept [{$accepted}] takes a BMP, stored as image/bmp whichever alias finfo reports"
+		);
+	}
+});
+
+test('a detected image/heif is canonicalized to image/heic before accept is matched', static function () use ($setup, $heif, $textProfile): void {
+	$detected = (new \finfo(\FILEINFO_MIME_TYPE))->file($heif);
+	requires($detected === 'image/heif', 'this libmagic reports ' . \var_export($detected, true) . ' for the HEIF fixture');
+
+	[$upload] = $setup();
+	$result = $upload->storeLocal($heif, ['accept' => ['image/heic']] + $textProfile);
+	check(
+		$result['mime'] === 'image/heic' && $result['source_mime'] === 'image/heic' && \str_ends_with($result['path'], '.heic'),
+		'finfo reports image/heif; Upload canonicalizes the detected type to image/heic before matching accept'
+	);
+});
+
+
+// -- 2. Source --------------------------------------------------------------------------
+
+test('a missing source or a directory as source is a developer error', static function () use ($setup, $sources, $textProfile): void {
+	[$upload] = $setup();
+	expectThrows(\InvalidArgumentException::class, static fn() => $upload->storeLocal($sources . '/missing.txt', $textProfile), 'a missing source is a developer error');
+	expectThrows(\InvalidArgumentException::class, static fn() => $upload->storeLocal($sources, $textProfile), 'a directory as source is a developer error');
+});
+
+test('an unreadable source is a developer error', static function () use ($setup, $source, $textProfile): void {
+	requires(canForceUnreadableFile(), 'file permissions are not enforced for this user or platform');
+
+	[$upload] = $setup();
+	$locked = $source('locked.txt', 'secret');
+	\chmod($locked, 0000);
+
+	try {
+		expectThrows(\InvalidArgumentException::class, static fn() => $upload->storeLocal($locked, $textProfile), 'an unreadable source is a developer error');
+	} finally {
+		\chmod($locked, 0644);
+	}
+});
+
+
+// -- 3. Placement -----------------------------------------------------------------------
+
+test('directory, $subdir, and 0 to 2 shard levels of the name make up the path', static function () use ($setup, $pdf, $pdfProfile): void {
+	[$upload, $root] = $setup();
+	$docs = ['directory' => 'docs'] + $pdfProfile;
+
+	$r0 = $upload->storeLocal($pdf, $docs, 'sub/inner');
+	$r1 = $upload->storeLocal($pdf, ['shard' => 1] + $docs);
+	$r2 = $upload->storeLocal($pdf, ['shard' => 2] + $docs, 'token');
+
+	check(\preg_match('~^docs/sub/inner/[0-9a-f]{32}\.pdf$~D', $r0['path']) === 1, 'shard 0: directory/subdir/{32 hex}.pdf');
+	check(\preg_match('~^docs/([0-9a-f]{2})/\1[0-9a-f]{30}\.pdf$~D', $r1['path']) === 1, 'shard 1: one directory of the first 2 hex characters');
+	check(\preg_match('~^docs/token/([0-9a-f]{2})/([0-9a-f]{2})/\1\2[0-9a-f]{28}\.pdf$~D', $r2['path']) === 1, 'shard 2: two 2-hex directories after the subdir');
+	check(\is_dir($root . '/docs/sub/inner'), 'missing directories are created');
+});
+
+test('every store writes a byte copy of the source under a new name and leaves no temporary file', static function () use ($setup, $pdf, $pdfProfile): void {
+	[$upload, $root] = $setup();
+	$docs = ['directory' => 'docs'] + $pdfProfile;
+	$results = [$upload->storeLocal($pdf, $docs, 'sub/inner'), $upload->storeLocal($pdf, ['shard' => 1] + $docs), $upload->storeLocal($pdf, ['shard' => 2] + $docs, 'token')];
+
+	foreach ($results as $result) {
+		check(\file_get_contents($root . '/' . $result['path']) === Fixtures::pdf(), 'the stored file is a byte copy of the source: ' . $result['path']);
+	}
+
+	check(\count(\array_unique(\array_column($results, 'path'))) === 3, 'every store gets a new name');
+	check(\preg_grep('~(^|/)\.~', filesUnder($root)) === [], 'no dot-prefixed temporary file remains');
+});
+
+test('without directory, $subdir, and sharding the file lands in the storage root', static function () use ($setup, $pdf, $pdfProfile): void {
+	[$upload, $root] = $setup();
+	$result = $upload->storeLocal($pdf, $pdfProfile);
+	check(\preg_match('~^[0-9a-f]{32}\.pdf$~D', $result['path']) === 1 && \is_file($root . '/' . $result['path']), 'without directory, subdir, and sharding the file lands in the storage root');
+});
+
+test('a root configured with a trailing slash works', static function () use ($dir, $pdf, $pdfProfile): void {
+	$slashRoot = $dir . '/slash-root';
+	\mkdir($slashRoot);
+	$result = (new Upload(testApp(testCfg(['upload' => ['storages' => ['files' => ['root' => $slashRoot . '/', 'web_path' => null]]]]))))->storeLocal($pdf, ['directory' => 'x'] + $pdfProfile);
+	check(\is_file($slashRoot . '/' . $result['path']), 'a root configured with a trailing slash works');
+});
+
+
+// -- 4. Storage roots -------------------------------------------------------------------
+
+test('an unprovisioned baseline root is a configuration error naming the storage, checked before content, and never created', static function () use ($text, $empty, $textProfile): void {
+	$upload = new Upload(testApp(testCfg()));
+	$e = expectThrows(UploadConfigException::class, static fn() => $upload->storeLocal($text, ['storage' => 'public'] + $textProfile), 'the unprovisioned baseline root of "public" is a config error');
+	check(\str_contains($e->getMessage(), "Storage 'public'") && !\file_exists(\CITOMNI_APP_PATH), 'the message names the storage, and the root is not created');
+	expectThrows(UploadConfigException::class, static fn() => $upload->storeLocal($empty, ['storage' => 'private'] + $textProfile), 'the root is checked before content validation');
+});
+
+test('a custom storage with a missing, non-string, or absent root is a configuration error, and nothing is created', static function () use ($dir, $text, $textProfile): void {
+	$upload = new Upload(testApp(testCfg(['upload' => ['storages' => [
+		'gone' => ['root' => $dir . '/gone', 'web_path' => null],
+		'numeric' => ['root' => 42, 'web_path' => null],
+		'rootless' => ['web_path' => 'x'],
+	]]])));
+
+	expectThrows(UploadConfigException::class, static fn() => $upload->storeLocal($text, ['storage' => 'gone'] + $textProfile), 'a custom storage with a missing root is a config error');
+	check(!\file_exists($dir . '/gone'), 'the missing custom root is not created');
+	expectThrows(UploadConfigException::class, static fn() => $upload->storeLocal($text, ['storage' => 'numeric'] + $textProfile), 'a non-string root is a config error');
+	expectThrows(UploadConfigException::class, static fn() => $upload->storeLocal($text, ['storage' => 'rootless'] + $textProfile), 'a storage without root is a config error');
+});
+
+test('the verified root is memoized per storage, and a fresh service checks the swapped root', static function () use ($setup, $dir, $text, $textProfile): void {
+	[$upload, $root, $app] = $setup();
+	check(\is_file($root . '/' . $upload->storeLocal($text, $textProfile)['path']), 'the first store verifies the root');
+	$app->cfg = testCfg(['upload' => ['storages' => ['files' => ['root' => $dir . '/nowhere', 'web_path' => null]]]]);
+	check(\is_file($root . '/' . $upload->storeLocal($text, $textProfile)['path']), 'the verified root is memoized per storage: the same service keeps using it');
+	expectThrows(UploadConfigException::class, static fn() => (new Upload($app))->storeLocal($text, $textProfile), 'a fresh service checks the swapped root');
+});
+
+
+// -- 5. Profile directory versus $subdir ------------------------------------------------
+
+test('an invalid profile directory is a configuration error, and the same path as $subdir is a developer error', static function () use ($setup, $text, $textProfile): void {
+	[$upload, $root] = $setup();
+
+	foreach (['../escape', '/abs', 'a//b', 'a/', '.hidden', 'a\\b', 'a b'] as $path) {
+		$label = \json_encode($path);
+		$e = expectThrows(UploadConfigException::class, static fn() => $upload->storeLocal($text, ['directory' => $path] + $textProfile), "an invalid profile directory {$label} is a config error");
+		check($e->getPrevious() instanceof \InvalidArgumentException, "the path error for directory {$label} is kept as previous");
+		expectThrows(\InvalidArgumentException::class, static fn() => $upload->storeLocal($text, $textProfile, $path), "an invalid \$subdir {$label} is a developer error");
+	}
+
+	check(\scandir($root) === ['.', '..'], 'invalid paths write nothing');
+});
+
+test('the $subdir is checked before the source', static function () use ($setup, $sources, $textProfile): void {
+	[$upload, $root] = $setup();
+	$e = expectThrows(\InvalidArgumentException::class, static fn() => $upload->storeLocal($sources . '/missing.txt', $textProfile, '../x'), 'an invalid $subdir with a missing source');
+	check(\str_contains($e->getMessage(), 'storage-relative path'), 'the $subdir is checked before the source');
+	check(\scandir($root) === ['.', '..'], 'invalid paths write nothing');
+});
+
+
+// -- 6. File and directory modes --------------------------------------------------------
+
+test('file_mode is applied to the stored file, and dir_mode to every created directory', static function () use ($setup, $text, $textProfile): void {
+	requires(!isWindows(), 'POSIX permissions do not apply on Windows');
+
+	[$upload, $root] = $setup(['file_mode' => 0640, 'dir_mode' => 0750]);
+	$result = $upload->storeLocal($text, ['directory' => 'modes/deep'] + $textProfile);
+	\clearstatcache();
+	check((\fileperms($root . '/' . $result['path']) & 0777) === 0640, 'file_mode is applied to the stored file');
+	check(
+		(\fileperms($root . '/modes') & 0777) === (0750 & ~\umask()) && (\fileperms($root . '/modes/deep') & 0777) === (0750 & ~\umask()),
+		'dir_mode is applied to every created directory, subject to umask'
+	);
+});
+
+test('file_mode null leaves the mode copy() created', static function () use ($setup, $text, $textProfile): void {
+	requires(!isWindows(), 'POSIX permissions do not apply on Windows');
+
+	[$upload, $root] = $setup(['file_mode' => null]);
+	$result = $upload->storeLocal($text, $textProfile);
+	\clearstatcache();
+	check((\fileperms($root . '/' . $result['path']) & 0777) === (0666 & ~\umask()), 'file_mode null leaves the mode copy() created');
+});
+
+
+// -- 7. Hash and result -----------------------------------------------------------------
+
+test('hash is "<algorithm>:<hex>" of the stored bytes, or null when the profile sets no hash', static function () use ($setup, $pdf, $pdfProfile): void {
+	[$upload, $root] = $setup();
+	$result = $upload->storeLocal($pdf, ['hash' => 'sha256'] + $pdfProfile);
+	check(
+		$result['hash'] === 'sha256:' . \hash_file('sha256', $root . '/' . $result['path']) && $result['hash'] === 'sha256:' . \hash('sha256', Fixtures::pdf()) && \preg_match('~^sha256:[0-9a-f]{64}$~D', $result['hash']) === 1,
+		'hash is "sha256:<hex>" of the stored bytes'
+	);
+	check($upload->storeLocal($pdf, ['hash' => 'md5'] + $pdfProfile)['hash'] === 'md5:' . \md5(Fixtures::pdf()), 'hash uses the configured algorithm');
+	check($upload->storeLocal($pdf, $pdfProfile)['hash'] === null, 'hash is null when the profile does not enable it');
+});
+
+test('the result of a plain file has the documented keys, in order, and the values of the file', static function () use ($setup, $pdf, $pdfProfile): void {
+	[$upload] = $setup();
+	$result = $upload->storeLocal($pdf, $pdfProfile, 'res');
+	check(\array_keys($result) === ['storage', 'path', 'mime', 'source_mime', 'size', 'original_name', 'width', 'height', 'hash', 'variants'], 'the result has the documented keys, in order');
+	check(
+		$result['storage'] === 'files' && \str_starts_with($result['path'], 'res/') && $result['mime'] === 'application/pdf' && $result['source_mime'] === 'application/pdf'
+		&& $result['size'] === \strlen(Fixtures::pdf()) && $result['original_name'] === 'report.pdf'
+		&& $result['width'] === null && $result['height'] === null && $result['hash'] === null && $result['variants'] === [],
+		'a plain file reports the finfo type, its own size, no dimensions, and no variants; original_name defaults to the source file name'
+	);
+});
+
+test('an explicit original name is sanitized metadata and never reaches the path', static function () use ($setup, $pdf, $pdfProfile): void {
+	[$upload] = $setup();
+	$result = $upload->storeLocal($pdf, $pdfProfile, '', 'C:\\fakepath\\Faktura 2026.pdf');
+	check($result['original_name'] === 'Faktura 2026.pdf' && !\str_contains($result['path'], 'Faktura'), 'an explicit original name is sanitized metadata and never reaches the path');
+});
+
+
+// -- 8. Routing -------------------------------------------------------------------------
+
+test('a PDF in an image profile and a JPEG in a plain profile take the plain path without the image service', static function () use ($setup, $pdf, $jpeg, $pdfProfile): void {
+	[$upload, , $app] = $setup();
+	$imageProfile = ['storage' => 'files', 'accept' => ['application/pdf', 'image/jpeg', 'image/png'], 'max_bytes' => 100_000, 'image' => [
+		'main' => ['format' => 'webp', 'width' => 1600, 'fit' => 'contain'],
+		'variants' => ['thumb' => ['format' => ImageFormat::Webp, 'width' => 300, 'height' => 300, 'fit' => 'cover']],
+	]];
+
+	$result = $upload->storeLocal($pdf, $imageProfile);
+	check(
+		$result['mime'] === 'application/pdf' && \str_ends_with($result['path'], '.pdf') && $result['width'] === null && $result['height'] === null && $result['variants'] === [],
+		'a PDF in an image profile follows the plain path'
+	);
+
+	$result = $upload->storeLocal($jpeg, ['accept' => ['image/jpeg']] + $pdfProfile);
+	check($result['mime'] === 'image/jpeg' && \str_ends_with($result['path'], '.jpg') && $result['variants'] === [], 'a JPEG in a profile without an image block follows the plain path');
+	check(!\in_array('image', $app->touched, true), 'the image service is never resolved on the plain path');
+});
+
+
+// -- 9. $move ---------------------------------------------------------------------------
+
+test('move: a rejection leaves the source untouched', static function () use ($setup, $source, $textProfile): void {
+	[$upload] = $setup();
+
+	$moving = $source('move-large.txt', \str_repeat('x', 50));
+	$e = expectThrows(UploadRejectedException::class, static fn() => $upload->storeLocal($moving, ['max_bytes' => 10] + $textProfile, move: true), 'move: a file above max_bytes is rejected');
+	check($e->reason === UploadRejection::TooLarge && \file_get_contents($moving) === \str_repeat('x', 50), 'a TooLarge rejection leaves the moved source untouched');
+
+	$moving = $source('move-type.txt', 'plain text');
+	$e = expectThrows(UploadRejectedException::class, static fn() => $upload->storeLocal($moving, ['accept' => ['application/pdf']] + $textProfile, move: true), 'move: a type outside accept is rejected');
+	check($e->reason === UploadRejection::TypeNotAllowed && \file_get_contents($moving) === 'plain text', 'a TypeNotAllowed rejection leaves the moved source untouched');
+});
+
+test('move: a successful store keeps the bytes and removes the source; without move the source stays', static function () use ($setup, $source, $pdfProfile): void {
+	[$upload, $root] = $setup();
+
+	$moving = $source('move-ok.pdf', Fixtures::pdf());
+	$result = $upload->storeLocal($moving, $pdfProfile, move: true);
+	\clearstatcache();
+	check(!\file_exists($moving) && \file_get_contents($root . '/' . $result['path']) === Fixtures::pdf(), 'a successful moved store keeps the bytes and removes the source');
+
+	$kept = $source('keep.pdf', Fixtures::pdf());
+	check(\is_file($root . '/' . $upload->storeLocal($kept, $pdfProfile)['path']) && \file_exists($kept), 'without move the source stays');
+});
+
+test('move: a developer error leaves the source untouched', static function () use ($setup, $source, $pdfProfile): void {
+	[$upload] = $setup();
+	$kept = $source('keep-invalid.pdf', Fixtures::pdf());
+	expectThrows(\InvalidArgumentException::class, static fn() => $upload->storeLocal($kept, $pdfProfile, '../x', null, true), 'move: an invalid $subdir is a developer error');
+	check(\file_exists($kept), 'a developer error leaves the moved source untouched');
+});
+
+test('move: a failed source removal keeps the source and the result, and is logged without masking anything', static function () use ($setup, $sources, $pdfProfile, $logCases): void {
+	requires(canForceUndeletableFile(), 'files cannot be made undeletable for this user or platform');
+
+	foreach ($logCases as $case => $failure) {
+		$log = new RecordingLog();
+		$log->failWith = $failure instanceof \Throwable ? $failure : null;
+		[$upload, $root, $app] = $setup([], ['log' => $failure === false ? null : $log]);
+
+		$lockedDir = $sources . '/locked-' . $case;
+		\mkdir($lockedDir);
+		$moving = $lockedDir . '/source.pdf';
+		\file_put_contents($moving, Fixtures::pdf());
+		$restore = lockAgainstDelete($moving);
+
+		try {
+			$result = $upload->storeLocal($moving, $pdfProfile, move: true);
+		} finally {
+			$restore();
+		}
+
+		check(\file_exists($moving) && \is_file($root . '/' . $result['path']), "a failed source removal keeps the source, and the result stands ({$case} log)");
+
+		if ($failure === false) {
+			check(!\in_array('log', $app->touched, true), 'without a registered log service, the log is never resolved');
+		} else {
+			$entry = $log->entries[0] ?? null;
+			check(\count($log->entries) === 1 && $entry['file'] === 'upload.jsonl' && $entry['category'] === 'cleanup', "the failed source removal is logged once to upload.jsonl, category cleanup ({$case} log)");
+			check(
+				$entry['context']['path'] === $moving && $entry['context']['stored_path'] === $result['path'] && $entry['context']['storage'] === 'files' && \is_string($entry['context']['error']),
+				"the log context names the source, the stored path, the storage, and the error ({$case} log)"
+			);
+		}
+	}
+});
+
+test('move: a failure after the copy (hashing an unreadable file) is compensated and leaves the source untouched', static function () use ($setup, $source, $pdfProfile): void {
+	requires(canForceUnreadableFile(), 'file permissions are not enforced for this user or platform');
+
+	[$upload, $root] = $setup(['file_mode' => 0]);
+	$moving = $source('after-copy.pdf', Fixtures::pdf());
+	$e = expectThrows(UploadStorageException::class, static fn() => $upload->storeLocal($moving, ['hash' => 'sha256', 'directory' => 'hashing'] + $pdfProfile, move: true), 'a failure after the copy (hashing an unreadable file) is a storage error');
+	check(\str_contains($e->getMessage(), 'Failed to hash'), 'the failure happened after the file was published');
+	check(filesUnder($root) === [], 'compensation removed the stored file, and no temporary file remains');
+	check(\file_get_contents($moving) === Fixtures::pdf(), 'a failure past the copy leaves the moved source untouched');
+});
+
+
+// -- 10. Compensation (FaultSource) -----------------------------------------------------
+
+test('an existing target is refused and never touched; the temporary file is removed, and the source stays', static function () use ($setup, $pdfProfile): void {
+	// An existing target cannot be prepared in advance: its name only appears once copy() runs.
+	[$upload, $root] = $setup();
+	$target = $root . '/clash';
+	$planted = null;
+
+	$url = FaultSource::create(Fixtures::pdf(), static function () use ($target, &$planted): void {
+		if ($planted !== null) {
+			return;
+		}
+
+		foreach (\glob($target . '/.*.tmp') ?: [] as $temporary) {
+			if (\preg_match('~^\.(.+)\.[0-9a-f]{12}\.tmp$~D', \basename($temporary), $match) === 1) {
+				$planted = $target . '/' . $match[1];
+				\file_put_contents($planted, 'not written by this call');
+
+				return;
+			}
+		}
+	});
+
+	$e = expectThrows(UploadStorageException::class, static fn() => $upload->storeLocal($url, ['directory' => 'clash'] + $pdfProfile, move: true), 'an existing target is refused');
+	check($planted !== null && \str_contains($e->getMessage(), 'already exists'), 'the target appeared while copy() ran');
+	check(\file_get_contents($planted) === 'not written by this call', 'the existing file is not touched');
+	check(filesUnder($root) === ['clash/' . \basename($planted)], 'the temporary file is removed, and nothing else remains');
+	check(FaultSource::exists($url), 'the moved source is untouched');
+});
+
+test('a read error during copy() removes the partial temporary file and leaves the source untouched', static function () use ($setup, $pdfProfile): void {
+	// A read error halfway through copy() leaves a partial temporary file that compensation must remove.
+	[$upload, $root] = $setup();
+	$copyReads = 0;
+
+	$url = FaultSource::create(\str_repeat("%PDF-1.4\n", 4096), static function () use ($root, &$copyReads): ?bool {
+		if ((\glob($root . '/partial/.*.tmp') ?: []) === []) {
+			return null;
+		}
+
+		return ++$copyReads > 1 ? false : null;
+	});
+
+	$e = expectThrows(UploadStorageException::class, static fn() => $upload->storeLocal($url, ['directory' => 'partial'] + $pdfProfile, move: true), 'a read error during copy() is a storage error');
+	check($copyReads > 1 && \str_contains($e->getMessage(), 'Failed to copy'), 'copy() failed after writing part of the temporary file');
+	check(filesUnder($root) === [], 'the partial temporary file is removed');
+	check(FaultSource::exists($url), 'the moved source is untouched after a failed copy');
+});
+
+test('a directory that turns read-only during copy() surfaces the rename failure, and the failed compensation is logged', static function () use ($setup, $pdfProfile, $logCases): void {
+	requires(canForceReadOnlyDir(), 'directories cannot be made read-only for this user or platform');
+
+	// The read-only directory makes both rename() and the compensating unlink() fail.
+	foreach ($logCases as $case => $failure) {
+		$log = new RecordingLog();
+		$log->failWith = $failure instanceof \Throwable ? $failure : null;
+		[$upload, $root, $app] = $setup([], ['log' => $failure === false ? null : $log]);
+
+		$target = $root . '/locked';
+		\mkdir($target);
+		$locked = false;
+
+		$url = FaultSource::create(Fixtures::pdf(), static function () use ($target, &$locked): void {
+			if (!$locked && (\glob($target . '/.*.tmp') ?: []) !== []) {
+				\chmod($target, 0555);
+				$locked = true;
+			}
+		});
+
+		try {
+			$e = expectThrows(UploadStorageException::class, static fn() => $upload->storeLocal($url, ['directory' => 'locked'] + $pdfProfile, move: true), "publishing into a directory that turned read-only fails ({$case} log)");
+		} finally {
+			\chmod($target, 0755);
+		}
+
+		check($locked && \str_contains($e->getMessage(), 'Failed to rename'), "the original exception surfaces unmasked ({$case} log)");
+
+		$temporaries = \glob($target . '/.*.tmp') ?: [];
+		check(\count($temporaries) === 1, "the temporary file that could not be removed stays behind, dot-prefixed ({$case} log)");
+		check(FaultSource::exists($url), "the moved source is untouched ({$case} log)");
+
+		if ($failure === false) {
+			check(!\in_array('log', $app->touched, true), 'without a registered log service, the log is never resolved');
+		} else {
+			$entry = $log->entries[0] ?? null;
+			check(
+				\count($log->entries) === 1 && $entry['file'] === 'upload.jsonl' && $entry['category'] === 'cleanup'
+				&& $entry['context']['path'] === $temporaries[0] && $entry['context']['storage'] === 'files' && \is_string($entry['context']['error']),
+				"the failed compensation is logged with storage, path, and error ({$case} log)"
+			);
+		}
+	}
+});
+
+done();

@@ -14,16 +14,17 @@ declare(strict_types=1);
  */
 
 /*
- * Mutation runner for citomni/upload. Not part of `composer test`.
+ * Mutation runner for citomni/upload. Not a suite: it is not named run.php, so
+ * tests/run.php does not run it.
  *
  * Applies each mutant defined in mutants.php to a disposable copy of the
- * package and runs the test scripts that are expected to kill it. A mutant is
- * killed when one of its scripts exits non-zero.
+ * package and runs the suites that are expected to kill it. A mutant is killed
+ * when one of its suites exits non-zero, that is, when a case fails.
  *
  * Usage:
- *   php tests/mutation/run.php            Run every mutant.
- *   php tests/mutation/run.php <filter>   Run the mutants whose id or label contains <filter>.
- *   php tests/mutation/run.php --list     Validate the definitions and list them.
+ *   php tests/mutation/mutate.php            Run every mutant.
+ *   php tests/mutation/mutate.php <filter>   Run the mutants whose id or label contains <filter>.
+ *   php tests/mutation/mutate.php --list     Validate the definitions and list them.
  *
  * Behavior:
  * - Validates every definition before anything runs, also when a filter is
@@ -34,12 +35,12 @@ declare(strict_types=1);
  *   sibling packages citomni/kernel and citomni/image into a temporary
  *   directory, in the layout tests/bootstrap.php expects. The working tree is
  *   never modified, so an interrupted run leaves nothing to restore.
- * - Runs every script the selected mutants use once without a mutation first.
+ * - Runs every suite the selected mutants use once without a mutation first.
  *   A failing baseline stops the run, because every mutant would look killed.
- * - Runs the scripts with the runner's PHP binary and php.ini. Run it where
- *   the suite normally runs (with ext-gd): fewer checks run elsewhere, and a
- *   mutant that only those checks kill then survives.
- * - A mutant marked unprivileged is only killed by checks that need a refused
+ * - Runs the suites with the runner's PHP binary and php.ini. Run it where
+ *   the suites normally run (with ext-gd): fewer cases run elsewhere, and a
+ *   mutant that only those cases kill then survives.
+ * - A mutant marked unprivileged is only killed by cases that need a refused
  *   unlink. Root never gets one, so such a mutant is skipped, and reported as
  *   skipped, unless the runner runs as a non-root POSIX user.
  *
@@ -50,9 +51,11 @@ declare(strict_types=1);
  *   no mutant ran.
  *
  * Notes:
- * - There is no timeout. A script that hangs stops the run; interrupt it, the
+ * - There is no timeout. A suite that hangs stops the run; interrupt it, the
  *   working tree is untouched. The temporary copy is removed after a run and
  *   kept after a failing baseline for inspection.
+ * - A suite runs every case even after a failure, so the reason shown for a
+ *   killed mutant is the first FAIL line of the first suite that failed.
  */
 
 const MUTATION_REQUIRED_KEYS = ['id', 'label', 'file', 'edits', 'tests'];
@@ -76,7 +79,7 @@ function mutationFail(string $message, int $code = 2): never {
  * Validate the definitions and compute each mutated file.
  *
  * Behavior:
- * - Checks keys and types, unique ids, existing files and test scripts.
+ * - Checks keys and types, unique ids, existing files and suites.
  * - Applies the edits in order; each search string must occur exactly once in
  *   the content at that point, and the result must differ from the original.
  *
@@ -140,11 +143,11 @@ function mutationPrepare(string $package, mixed $definitions): array {
 		}
 
 		if (!\is_array($tests) || $tests === [] || !\array_is_list($tests)) {
-			$errors[] = "{$name}: tests must be a non-empty list of script names.";
+			$errors[] = "{$name}: tests must be a non-empty list of suite names.";
 		} else {
 			foreach ($tests as $test) {
-				if (!\is_string($test) || !\is_file("{$package}/tests/{$test}_test.php")) {
-					$errors[] = "{$name}: there is no test script tests/" . (\is_string($test) ? $test : '?') . '_test.php.';
+				if (!\is_string($test) || !\is_file("{$package}/tests/{$test}/run.php")) {
+					$errors[] = "{$name}: there is no suite tests/" . (\is_string($test) ? $test : '?') . '/run.php.';
 				}
 			}
 		}
@@ -222,7 +225,7 @@ function mutationLint(array $mutants): array {
 /**
  * Run the PHP binary and return its exit code and combined output.
  *
- * Output goes to a temporary file rather than a pipe, so a process the script
+ * Output goes to a temporary file rather than a pipe, so a process the suite
  * starts (the PHP development server, for example) cannot hold the runner.
  *
  * @param list<string> $arguments Arguments after the binary (and ini options).
@@ -263,16 +266,16 @@ function mutationPhp(array $arguments, string $cwd, bool $withIni = true): array
 
 
 /**
- * Pick the line that explains a failure: the failed check or the fatal error.
+ * Pick the line that explains a failure: the first failed case or the fatal error.
  *
- * @param string $output Script output.
+ * @param string $output Suite output, stdout and stderr combined.
  * @return string One line, at most 150 characters.
  */
 function mutationReason(string $output): string {
 	$lines = \array_values(\array_filter(\array_map(\trim(...), \preg_split('/\R/', $output) ?: []), static fn(string $line): bool => $line !== ''));
 
 	foreach ($lines as $line) {
-		if (\str_contains($line, 'FAILED') || \str_contains($line, 'Fatal error') || \str_contains($line, 'Parse error')) {
+		if (\str_starts_with($line, 'FAIL ') || \str_contains($line, 'Fatal error') || \str_contains($line, 'Parse error')) {
 			return \mb_strimwidth($line, 0, 150, '...');
 		}
 	}
@@ -368,7 +371,7 @@ $listOnly = \in_array('--list', $arguments, true);
 $filters = \array_values(\array_diff($arguments, ['--list']));
 
 if (\count($filters) > 1 || ($listOnly && $filters !== [])) {
-	mutationFail('Usage: php tests/mutation/run.php [<filter> | --list]');
+	mutationFail('Usage: php tests/mutation/mutate.php [<filter> | --list]');
 }
 
 $filter = $filters[0] ?? null;
@@ -417,17 +420,17 @@ $ini = \php_ini_loaded_file();
 	$unprivileged ? 'unprivileged POSIX user' : 'privileged or non-POSIX user, so unprivileged mutants are skipped',
 );
 
-$scripts = \array_values(\array_unique(\array_merge(...\array_map(static fn(array $mutant): array => $mutant['tests'], $runnable ?: [['tests' => []]]))));
+$suites = \array_values(\array_unique(\array_merge(...\array_map(static fn(array $mutant): array => $mutant['tests'], $runnable ?: [['tests' => []]]))));
 
-foreach ($scripts as $script) {
-	[$code, $output] = mutationPhp(["tests/{$script}_test.php"], $root);
+foreach ($suites as $suite) {
+	[$code, $output] = mutationPhp(["tests/{$suite}/run.php"], $root);
 
 	if ($code !== 0) {
-		mutationFail("Baseline failed: tests/{$script}_test.php fails without a mutation: " . mutationReason($output) . "\nThe copy is kept at {$sandbox}.");
+		mutationFail("Baseline failed: tests/{$suite}/run.php fails without a mutation: " . mutationReason($output) . "\nThe copy is kept at {$sandbox}.");
 	}
 }
 
-echo 'Baseline: ' . \count($scripts) . " test scripts pass without a mutation.\n\n";
+echo 'Baseline: ' . \count($suites) . " suites pass without a mutation.\n\n";
 
 
 // -- Mutants --------------------------------------------------------------------------
@@ -446,11 +449,11 @@ foreach ($selected as $mutant) {
 	\file_put_contents($target, $mutant['content']);
 
 	try {
-		foreach ($mutant['tests'] as $script) {
-			[$code, $output] = mutationPhp(["tests/{$script}_test.php"], $root);
+		foreach ($mutant['tests'] as $suite) {
+			[$code, $output] = mutationPhp(["tests/{$suite}/run.php"], $root);
 
 			if ($code !== 0) {
-				$verdict = "{$script}_test: " . mutationReason($output);
+				$verdict = "{$suite}: " . mutationReason($output);
 				break;
 			}
 		}

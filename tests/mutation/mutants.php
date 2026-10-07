@@ -14,7 +14,7 @@ declare(strict_types=1);
  */
 
 /*
- * Mutant definitions for tests/mutation/run.php.
+ * Mutant definitions for tests/mutation/mutate.php.
  *
  * Each mutant breaks one behavior the test suite is expected to catch. The
  * runner applies the edits of a mutant to a copy of the package, in order, and
@@ -26,8 +26,9 @@ declare(strict_types=1);
  * - label: the behavior the mutant breaks.
  * - file: package-relative file to mutate.
  * - edits: [search, replace] pairs, applied in order.
- * - tests: test scripts, without "_test.php", run in order until one fails.
- * - unprivileged: optional; true when only checks that need a refused unlink
+ * - tests: suites, as their directory names under tests/, run in order until
+ *   one fails.
+ * - unprivileged: optional; true when only cases that need a refused unlink
  *   kill the mutant. Root never gets a refused unlink, so the runner skips
  *   such a mutant unless it runs as a non-root POSIX user.
  */
@@ -342,7 +343,7 @@ return [
 				"\\UPLOAD_ERR_FORM_SIZE => new UploadRejectedException(UploadRejection::TooLarge",
 			],
 		],
-		'tests' => ['intake', 'http_upload', 'storage'],
+		'tests' => ['intake', 'http-upload', 'storage'],
 	],
 
 	[
@@ -355,7 +356,7 @@ return [
 				"['original_name' => \$originalName]),\n\t\t\t\\UPLOAD_ERR_PARTIAL",
 			],
 		],
-		'tests' => ['intake', 'http_upload', 'storage'],
+		'tests' => ['intake', 'http-upload', 'storage'],
 	],
 
 	[
@@ -368,7 +369,7 @@ return [
 				"\t\tif (false) {",
 			],
 		],
-		'tests' => ['intake', 'http_upload', 'storage'],
+		'tests' => ['intake', 'http-upload', 'storage'],
 	],
 
 	[
@@ -381,7 +382,7 @@ return [
 				"return \$this->ingest(\$tmpName, \$resolved, \$subdir, \$originalName, false);",
 			],
 		],
-		'tests' => ['intake', 'http_upload', 'storage'],
+		'tests' => ['intake', 'http-upload', 'storage'],
 	],
 
 	[
@@ -394,7 +395,7 @@ return [
 				"\t\t// Storage configuration fails fast, before any user-side upload error is reported.\n",
 			],
 		],
-		'tests' => ['intake', 'http_upload', 'storage'],
+		'tests' => ['intake', 'http-upload', 'storage'],
 	],
 
 	[
@@ -407,7 +408,7 @@ return [
 				"if (\$name === null) {",
 			],
 		],
-		'tests' => ['intake', 'http_upload', 'storage'],
+		'tests' => ['intake', 'http-upload', 'storage'],
 	],
 
 	[
@@ -420,7 +421,7 @@ return [
 				"\t\treturn \$reason->fallbackMessage();\n",
 			],
 		],
-		'tests' => ['intake', 'http_upload', 'storage'],
+		'tests' => ['intake', 'http-upload', 'storage'],
 	],
 
 	[
@@ -433,7 +434,7 @@ return [
 				"'upload', 'app', \$reason->fallbackMessage()",
 			],
 		],
-		'tests' => ['intake', 'http_upload', 'storage'],
+		'tests' => ['intake', 'http-upload', 'storage'],
 	],
 
 	[
@@ -446,7 +447,7 @@ return [
 				"return \$file;",
 			],
 		],
-		'tests' => ['intake', 'http_upload', 'storage'],
+		'tests' => ['intake', 'http-upload', 'storage'],
 	],
 
 	[
@@ -459,7 +460,7 @@ return [
 				"if (false) {",
 			],
 		],
-		'tests' => ['intake', 'http_upload', 'storage'],
+		'tests' => ['intake', 'http-upload', 'storage'],
 	],
 
 	[
@@ -472,7 +473,7 @@ return [
 				"\t\t\tif (!\\is_array(\$fields[\$key])) {\n\t\t\t\t\$one = self::leaf(\$fields, null);\n\t\t\t\treturn \$one === null ? [] : [\$one];\n\t\t\t}\n",
 			],
 		],
-		'tests' => ['intake', 'http_upload', 'storage'],
+		'tests' => ['intake', 'http-upload', 'storage'],
 	],
 
 	[
@@ -485,7 +486,7 @@ return [
 				"\t\t\tforeach ([] as \$step) {",
 			],
 		],
-		'tests' => ['intake', 'http_upload', 'storage'],
+		'tests' => ['intake', 'http-upload', 'storage'],
 	],
 
 	[
@@ -498,7 +499,7 @@ return [
 				"\t\t[\$tmpName, \$originalName, \$error] = self::uploadEntry(\$file, 'checkUpload');\n\t\t\$this->storageRoot(\$resolved['storage']);\n",
 			],
 		],
-		'tests' => ['intake', 'http_upload'],
+		'tests' => ['intake', 'http-upload'],
 	],
 
 	[
@@ -511,7 +512,7 @@ return [
 				"\t\t\$examined = \$this->examine(\$tmpName, \$resolved, \$originalName);\n\t\t@\\unlink(\$tmpName);\n",
 			],
 		],
-		'tests' => ['intake', 'http_upload'],
+		'tests' => ['intake', 'http-upload'],
 	],
 
 	[
@@ -524,7 +525,7 @@ return [
 				"\t\t\t'mime' => (string)(\$file['type'] ?? ''),\n",
 			],
 		],
-		'tests' => ['intake', 'http_upload'],
+		'tests' => ['intake', 'http-upload'],
 	],
 
 	[
@@ -537,7 +538,7 @@ return [
 				"\t\t\$examined = ['mime' => 'application/pdf', 'size' => (int)@\\filesize(\$tmpName), 'info' => null];\n",
 			],
 		],
-		'tests' => ['intake', 'http_upload'],
+		'tests' => ['intake', 'http-upload'],
 	],
 
 	// -- Batches: storeUploads() and cleanupStored() ----------------------------------
@@ -552,7 +553,7 @@ return [
 				"\t\t\t\t// A failure part-way: the files of earlier entries must not linger.\n",
 			],
 		],
-		'tests' => ['http_upload'],
+		'tests' => ['http-upload'],
 	],
 
 	[
@@ -565,7 +566,7 @@ return [
 				"\t\t\t\t} catch (\\Throwable \$e) {\n\t\t\t\t\t\$rejected[] = \$e;",
 			],
 		],
-		'tests' => ['intake', 'http_upload'],
+		'tests' => ['intake', 'http-upload'],
 	],
 
 	[
@@ -578,7 +579,7 @@ return [
 				"\t\t\t\t\t\$rejected[] = \$e;\n\t\t\t\t\tbreak;\n",
 			],
 		],
-		'tests' => ['intake', 'http_upload'],
+		'tests' => ['intake', 'http-upload'],
 	],
 
 	[
@@ -617,7 +618,7 @@ return [
 				"\t\t\tif (false) {",
 			],
 		],
-		'tests' => ['intake', 'http_upload'],
+		'tests' => ['intake', 'http-upload'],
 	],
 
 	[
@@ -643,7 +644,7 @@ return [
 				"",
 			],
 		],
-		'tests' => ['http_upload'],
+		'tests' => ['http-upload'],
 	],
 
 	[
@@ -656,7 +657,7 @@ return [
 				"\t\tforeach (\$paths as \$path) {\n\t\t\t@\\unlink(\$path);\n\t\t}\n",
 			],
 		],
-		'tests' => ['http_upload'],
+		'tests' => ['http-upload'],
 		'unprivileged' => true,
 	],
 
@@ -771,7 +772,7 @@ return [
 				"\t\tif (false) {",
 			],
 		],
-		'tests' => ['image_path', 'profile', 'image_integration'],
+		'tests' => ['image-path', 'profile', 'image-integration'],
 	],
 
 	[
@@ -784,7 +785,7 @@ return [
 				"\t\t\tforeach (\\array_keys(\$outputs) as \$key) {",
 			],
 		],
-		'tests' => ['image_path', 'profile', 'image_integration'],
+		'tests' => ['image-path', 'profile', 'image-integration'],
 	],
 
 	[
@@ -797,7 +798,7 @@ return [
 				"\t\t\t\t\t// skipped\n",
 			],
 		],
-		'tests' => ['image_path', 'profile', 'image_integration'],
+		'tests' => ['image-path', 'profile', 'image-integration'],
 	],
 
 	[
@@ -810,7 +811,7 @@ return [
 				"\t\t\t\$files = \$this->app->image->save(\$source, \$outputs, \$profile['image']['options']);\n\t\t} catch (\\DomainException \$e) {\n\t\t\tthrow new UploadRejectedException(UploadRejection::InvalidImage, \$context, \$e);\n",
 			],
 		],
-		'tests' => ['image_path', 'profile', 'image_integration'],
+		'tests' => ['image-path', 'profile', 'image-integration'],
 	],
 
 	[
@@ -823,7 +824,7 @@ return [
 				"\t\t} catch (\\DomainException \$e) {\n\t\t\tthrow new UploadConfigException(\$profile['label']",
 			],
 		],
-		'tests' => ['image_path', 'profile', 'image_integration'],
+		'tests' => ['image-path', 'profile', 'image-integration'],
 	],
 
 	[
@@ -836,7 +837,7 @@ return [
 				"\t\t} catch (\\RuntimeException \$e) {\n\t\t\tthrow new UploadStorageException('x', 0, \$e);\n\t\t} catch (ImageWriteException \$e) {",
 			],
 		],
-		'tests' => ['image_path', 'profile', 'image_integration'],
+		'tests' => ['image-path', 'profile', 'image-integration'],
 	],
 
 	[
@@ -849,7 +850,7 @@ return [
 				"\t\t\t\$files = [];\n\t\t\tif (!\$produced) { \$this->writeFile(\$source, \$absoluteDirectory, '.early', \$fileMode, false, \$written); }\n\n\t\t\t// The image job runs before",
 			],
 		],
-		'tests' => ['image_path', 'profile', 'image_integration'],
+		'tests' => ['image-path', 'profile', 'image-integration'],
 	],
 
 	[
@@ -862,7 +863,7 @@ return [
 				"",
 			],
 		],
-		'tests' => ['image_path', 'profile', 'image_integration'],
+		'tests' => ['image-path', 'profile', 'image-integration'],
 	],
 
 	[
@@ -875,7 +876,7 @@ return [
 				"\t\tif (false) {",
 			],
 		],
-		'tests' => ['image_path', 'profile', 'image_integration'],
+		'tests' => ['image-path', 'profile', 'image-integration'],
 	],
 
 	[
@@ -888,7 +889,7 @@ return [
 				"\t\tif (false) {",
 			],
 		],
-		'tests' => ['image_path', 'profile', 'image_integration'],
+		'tests' => ['image-path', 'profile', 'image-integration'],
 	],
 
 	[
@@ -901,7 +902,7 @@ return [
 				"(\$info['width'] ?? null)",
 			],
 		],
-		'tests' => ['image_path', 'profile', 'image_integration'],
+		'tests' => ['image-path', 'profile', 'image-integration'],
 	],
 
 	[
@@ -914,7 +915,7 @@ return [
 				"'size' => \$size,",
 			],
 		],
-		'tests' => ['image_path', 'profile', 'image_integration'],
+		'tests' => ['image-path', 'profile', 'image-integration'],
 	],
 
 	[
@@ -927,7 +928,7 @@ return [
 				"\$outputs['main'] = \$image['main']['spec'] + ['path' => self::absolute(\$root, \$path), 'overwrite' => false];",
 			],
 		],
-		'tests' => ['image_path', 'profile', 'image_integration'],
+		'tests' => ['image-path', 'profile', 'image-integration'],
 	],
 
 	[
@@ -940,7 +941,7 @@ return [
 				"\$this->app->image->save(\$source, \$outputs, []);",
 			],
 		],
-		'tests' => ['image_path', 'profile', 'image_integration'],
+		'tests' => ['image-path', 'profile', 'image-integration'],
 	],
 
 	[
@@ -953,7 +954,7 @@ return [
 				"MimeMap::extension('image/jpeg')",
 			],
 		],
-		'tests' => ['image_path', 'delete', 'read_path'],
+		'tests' => ['image-path', 'delete', 'read-path'],
 	],
 
 	// -- Deletion and cleanup ---------------------------------------------------------
@@ -1020,7 +1021,7 @@ return [
 				"\t\tif (false) {\n\t\t\tthrow new \\InvalidArgumentException('A file path",
 			],
 		],
-		'tests' => ['delete', 'read_path'],
+		'tests' => ['delete', 'read-path'],
 	],
 
 	[
@@ -1115,7 +1116,7 @@ return [
 				"return self::absolute(\$this->storageRoot(\$storage), \$path);",
 			],
 		],
-		'tests' => ['read_path'],
+		'tests' => ['read-path'],
 	],
 
 	[
@@ -1128,7 +1129,7 @@ return [
 				"\t\ttry {\n\t\t\tStoragePath::validateRelative('x');",
 			],
 		],
-		'tests' => ['read_path'],
+		'tests' => ['read-path'],
 	],
 
 	[
@@ -1141,7 +1142,7 @@ return [
 				"\t\tif (false) {",
 			],
 		],
-		'tests' => ['read_path'],
+		'tests' => ['read-path'],
 	],
 
 	[
@@ -1154,7 +1155,7 @@ return [
 				"return \$base === '' ? \$path : '/' . \$base . '/' . \$path;",
 			],
 		],
-		'tests' => ['read_path'],
+		'tests' => ['read-path'],
 	],
 
 	[
@@ -1167,7 +1168,7 @@ return [
 				"\t\tif (false) {",
 			],
 		],
-		'tests' => ['read_path'],
+		'tests' => ['read-path'],
 	],
 
 	[
@@ -1180,7 +1181,7 @@ return [
 				"return StoragePath::variant(\$mainPath, (string)\$key, \$format->value);",
 			],
 		],
-		'tests' => ['delete', 'read_path'],
+		'tests' => ['delete', 'read-path'],
 	],
 
 	[
@@ -1193,7 +1194,7 @@ return [
 				"\t\t\t\$targets[\$key] = StoragePath::variant(\$path, (string)\$key, \$variant['format']->value);",
 			],
 		],
-		'tests' => ['delete', 'read_path'],
+		'tests' => ['delete', 'read-path'],
 	],
 
 	[
@@ -1206,7 +1207,7 @@ return [
 				"\t\tif (false) {\n\t\t\treturn self::FORMAT_EXTENSIONS[\$format->value] ?? \$format->value;",
 			],
 		],
-		'tests' => ['util', 'read_path'],
+		'tests' => ['util', 'read-path'],
 	],
 
 ];

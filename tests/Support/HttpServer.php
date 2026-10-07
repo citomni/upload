@@ -29,15 +29,18 @@ namespace CitOmni\Upload\Tests\Support;
  * - post() sends one multipart request and returns the router's JSON report.
  *   A router that answers with anything else fails loudly, with the response
  *   and the server log in the message.
- * - stop() terminates the process and is idempotent. Tests call it in finally;
- *   start() also registers it as a shutdown function as a backstop.
+ * - stop() terminates the process and is idempotent. The suite calls it in
+ *   finally; start() also registers it as a shutdown function as a backstop.
  *
  * Notes:
  * - The free port is found by binding 127.0.0.1:0 and releasing it. When the
  *   server cannot take the port after all, start() retries with a new one.
+ * - The server runs with the same PHP binary and php.ini as the suite (the
+ *   loaded file, the default lookup, or -n), as tests/run.php starts the
+ *   suites. Only the -d settings given to start() are added.
  * - The command is passed to proc_open() as an array, so no shell sits between
- *   the test and the server, and stop() signals the server itself.
- * - The server inherits the user and umask of the test process.
+ *   the suite and the server, and stop() signals the server itself.
+ * - The server inherits the user, the umask, and the environment of the suite.
  */
 final class HttpServer {
 
@@ -87,7 +90,12 @@ final class HttpServer {
 				return null;
 			}
 
-			$command = [\PHP_BINARY];
+			// Same php.ini as the suite: the loaded file, the default lookup, or none at all.
+			$command = match (true) {
+				\php_ini_loaded_file() !== false => [\PHP_BINARY, '-c', \php_ini_loaded_file()],
+				\php_ini_scanned_files() !== false => [\PHP_BINARY],
+				default => [\PHP_BINARY, '-n'],
+			};
 
 			foreach ($ini as $name => $value) {
 				\array_push($command, '-d', $name . '=' . $value);

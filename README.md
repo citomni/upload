@@ -1088,7 +1088,7 @@ Not provided:
 
 The tests cover Upload's own logic and its boundary with `citomni/image`. Image correctness (orientation, geometry, alpha, compression, metadata, codecs, backends, color, multi-frame, output verification) is tested in `citomni/image` only.
 
-The tests are plain PHP regression scripts, one per area, and each stops with a non-zero exit code at the first failed check. There is no PHPUnit and no Composer installation: `tests/bootstrap.php` loads Upload's `src/` and `tests/` and the sibling packages `../kernel/src` and `../image/src`, so the tests run in this development layout and fail with the searched paths when a sibling is missing:
+The tests are standalone suites in plain PHP, one per area, each run in its own process. There is no PHPUnit and no Composer installation: `tests/bootstrap.php` loads Upload's `src/` and `tests/` and the sibling packages `../kernel/src` and `../image/src`, so the suites run in this development layout and fail with the searched paths when a sibling is missing:
 
 ```text
 citomni/
@@ -1097,51 +1097,56 @@ citomni/
 └── upload/
 ```
 
-An installation under `vendor/citomni/` has the same shape, but `tests/` is excluded from the Composer dist archive, so the tests need a source checkout.
+An installation under `vendor/citomni/` has the same shape, but `tests/` is excluded from the Composer dist archive, so the suites need a source checkout.
 
-Run every script with:
+Run every suite with:
 
 ```bash
-composer test
+php tests/run.php
 ```
 
-Run one script with `php tests/storage_test.php`.
+`composer test` runs the same command. Run one suite with `php tests/<suite>/run.php`, for example `php tests/storage/run.php`.
 
-| Script | Covers |
+A suite reports every case as `PASS <case>` on stdout, `FAIL <case> - <reason>` on stderr, or `SKIP <case>: <reason>` when the platform cannot run it. A failed case does not stop the suite. The last line holds the totals, `N passed, M failed[, K skipped]`, and the exit code is 1 when a case failed. `tests/run.php` prints each suite under `== <suite>/run.php` and ends with the summed totals under `== total`. Each suite has a README with its cases, its expected totals, and the conditions under which a case is skipped.
+
+| Suite | Covers |
 |---|---|
-| `util_test.php` | `StoragePath`, `OriginalName`, `MimeMap`, `UploadRejection`, and the exception hierarchy |
-| `profile_test.php` | Every profile rule, the Registry baseline, memoization, inline profiles, and merge semantics |
-| `intake_test.php` | `UploadedFiles`, error-code mapping, check order, provenance, `checkUpload()` and `storeUploads()` without HTTP, `rejectionMessage()`, and the language files |
-| `storage_test.php` | Generic validation, plain writes, the result, routing, `$move`, and compensation |
-| `image_path_test.php` | The image path against a scripted `citomni/image` double: outputs, order, result fields, exception translation, and compensation |
-| `image_integration_test.php` | The real `citomni/image`: `finfo` against `inspect()` on crafted headers, and the happy path with GD |
-| `delete_test.php` | `delete*()` and `cleanup*()`, `cleanupStored()` included, on an in-memory storage and on the real filesystem |
-| `read_path_test.php` | `variantPath()`, `absolutePath()`, `webPath()`, and proof that they do no IO |
-| `http_upload_test.php` | End to end through PHP's built-in web server: `$_FILES` shapes, `storeUpload()` with real uploads and error codes, image uploads, `checkUpload()` without writes, and `storeUploads()` batches with partial acceptance and compensation |
+| `util` | `StoragePath`, `OriginalName`, `MimeMap`, `UploadRejection`, and the exception hierarchy |
+| `profile` | Every profile rule, the Registry baseline, memoization, inline profiles, and merge semantics |
+| `intake` | `UploadedFiles`, error-code mapping, check order, provenance, `checkUpload()` and `storeUploads()` without HTTP, `rejectionMessage()`, and the language files |
+| `storage` | Generic validation, plain writes, the result, routing, `$move`, and compensation |
+| `image-path` | The image path against a scripted `citomni/image` double: outputs, order, result fields, exception translation, and compensation |
+| `image-integration` | The real `citomni/image`: `finfo` against `inspect()` on crafted headers and encoded files, and the happy path with GD |
+| `delete` | `delete*()` and `cleanup*()`, `cleanupStored()` included, on an in-memory storage and on the real filesystem |
+| `read-path` | `variantPath()`, `absolutePath()`, `webPath()`, and proof that they do no IO |
+| `http-upload` | End to end through PHP's built-in web server: `$_FILES` shapes, `storeUpload()` with real uploads and error codes, image uploads, `checkUpload()` without writes, and `storeUploads()` batches with partial acceptance and compensation |
 
-The scripts require PHP 8.5, `ext-fileinfo`, and `ext-mbstring`, and the image checks require `ext-gd`. Every unsuppressed diagnostic fails a run, including deprecations and `#[\NoDiscard]` warnings. Failures are forced through the filesystem or through stream wrappers in `tests/Support/`; the production code has no test seams.
+The suites require PHP 8.5, `ext-fileinfo`, and `ext-mbstring`, and the image cases require `ext-gd`. Every unsuppressed diagnostic fails the case, including deprecations and `#[\NoDiscard]` warnings. Failures are forced through the filesystem or through stream wrappers in `tests/Support/`; the production code has no test seams. The package has no database suites and no multi-process cases, so neither `CITOMNI_TEST_PASSWORD` nor `CITOMNI_TEST_PARALLEL` changes a run.
 
-Checks the platform cannot support print a `SKIP:` line instead of failing:
+Cases the platform cannot run report `SKIP` instead of failing:
 
-- Failures that only file permissions can force, such as a refused unlink or a read-only directory, are decided by behavior probes, not by user ID. They skip as root and on Windows; deletion semantics are still covered on every platform through an in-memory storage.
-- Image checks skip without `ext-gd`, and format by format without an encoder for the format.
-- `http_upload_test.php` skips outside the CLI, without `proc_open()`, or when PHP's built-in web server cannot start on `127.0.0.1`.
-- The `image/heif` alias check skips when the local libmagic reports another type for its fixture.
+- Failures that only file permissions can force, such as a refused unlink or a read-only directory, are decided by behavior probes, not by user ID. They skip as root. On Windows only the refused unlink of a read-only file can be forced, so the cases that need a read-only directory, an unreadable file, or a link skip there. Deletion semantics are still covered on every platform through an in-memory storage.
+- Checks of POSIX file modes skip on Windows.
+- Image cases skip without `ext-gd`, and format by format without an encoder for the format.
+- The `image/heif` alias case skips when finfo reports another type for its fixture.
+
+PHP's built-in web server is not optional: when it cannot start on `127.0.0.1`, every `http-upload` case that sends a request fails with the reason.
 
 ### Mutation testing
 
-`tests/mutation/` holds a mutation runner and 88 mutants in the areas `profile`, `store`, `intake`, `batch`, `image`, `delete`, and `path`. It is not part of `composer test`.
+`tests/mutation/` holds a mutation runner and 88 mutants in the areas `profile`, `store`, `intake`, `batch`, `image`, `delete`, and `path`. The runner is named `mutate.php`, not `run.php`, so `tests/run.php` does not run it.
 
 ```bash
-php tests/mutation/run.php            # All mutants.
-php tests/mutation/run.php <filter>   # Mutants whose id or label contains <filter>.
-php tests/mutation/run.php --list     # Validate the definitions and list them.
+php tests/mutation/mutate.php            # All mutants.
+php tests/mutation/mutate.php <filter>   # Mutants whose id or label contains <filter>.
+php tests/mutation/mutate.php --list     # Validate the definitions and list them.
 ```
 
 - Every definition is validated before anything runs, also with a filter: each search string must occur exactly once, and the mutated file must parse.
-- The runner works in a temporary copy of the package with the sibling `kernel` and `image` sources and never modifies the working tree. Each affected script first runs without a mutation; a failing baseline stops the run and keeps the copy for inspection.
+- Each mutant names the suites expected to kill it. A mutant is killed when one of them exits non-zero, that is, when a case fails.
+- The runner works in a temporary copy of the package with the sibling `kernel` and `image` sources and never modifies the working tree. Each affected suite first runs without a mutation; a failing baseline stops the run and keeps the copy for inspection.
 - Exit code `0` means that every mutant that ran was killed, `1` that at least one survived, and `2` invalid definitions, a missing sibling package, or a failing baseline.
-- Run it where the suite normally runs, with `ext-gd`, as a non-root POSIX user: five mutants are killed only by a refused unlink and are skipped as root. There is no timeout.
+- Run it where the suites normally run, with `ext-gd`, as a non-root POSIX user: five mutants are killed only by a refused unlink and are skipped as root. There is no timeout.
 
 ---
 
