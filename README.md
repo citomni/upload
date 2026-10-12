@@ -990,6 +990,7 @@ Inherited from `citomni/image` and not retested here: metadata stripping (EXIF, 
 
 - [ ] `config/providers.php` lists both `\CitOmni\Image\Boot\Registry` and `\CitOmni\Upload\Boot\Registry`.
 - [ ] The storage roots exist and are writable for the PHP process; with the baseline, `public/uploads/u/` and `var/storage/`.
+- [ ] Stored files stay out of Git. `install/manifest.php` declares the contents of the baseline roots for the `.gitignore` block that `citomni/installer` maintains, keeping only each root's `.gitkeep`. An application that moves a root writes the ignore rule for the new location itself.
 - [ ] The storage filesystem supports hard links. `citomni/image` needs them for no-clobber publishing; without them, image outputs fail with `ImageWriteException`, which Upload reports as `UploadStorageException`.
 - [ ] The web server is configured for the public storage; see [Web server configuration](#web-server-configuration-for-public-storage).
 - [ ] For every image profile, `$this->app->image->capabilities()` reports a decoder for each accepted image type and an encoder for each output format. Otherwise such uploads end in `ImageCapabilityException`, a server error.
