@@ -31,8 +31,7 @@
         "php": "^8.5",
         "ext-fileinfo": "*",
         "ext-mbstring": "*",
-        "citomni/kernel": "^1.0.2.2",
-        "citomni/image": "^1.0"
+        "citomni/image": "^1.0.0.3"
     },
     "suggest": {
         "citomni/infrastructure": "Provides the log and txt services. Upload logs best-effort cleanup failures and translates rejection messages when they are registered."
