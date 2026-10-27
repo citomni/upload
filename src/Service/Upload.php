@@ -803,7 +803,8 @@ final class Upload extends BaseService {
 			return $this->profiles[$profile];
 		}
 
-		$node = $this->app->cfg->upload->profiles[$profile] ?? null;
+		$profiles = $this->app->cfg->upload->profiles;
+		$node = $profiles[$profile] ?? null;
 
 		if ($node === null) {
 			throw new UploadConfigException("Upload profile '{$profile}' is not defined in upload.profiles.");
@@ -854,7 +855,9 @@ final class Upload extends BaseService {
 			throw new UploadConfigException("{$label}: 'storage' must be a non-empty string.");
 		}
 
-		if (($this->app->cfg->upload->storages[$storage] ?? null) === null) {
+		$storages = $this->app->cfg->upload->storages;
+
+		if (($storages[$storage] ?? null) === null) {
 			throw new UploadConfigException("{$label}: storage '{$storage}' is not defined in upload.storages.");
 		}
 
@@ -1104,7 +1107,8 @@ final class Upload extends BaseService {
 			return $this->configuredRoots[$storage];
 		}
 
-		$node = $this->app->cfg->upload->storages[$storage] ?? null;
+		$storages = $this->app->cfg->upload->storages;
+		$node = $storages[$storage] ?? null;
 
 		if ($node === null) {
 			throw new UploadConfigException("Storage '{$storage}' is not defined in upload.storages.");
@@ -1195,7 +1199,8 @@ final class Upload extends BaseService {
 			return $this->webBases[$storage];
 		}
 
-		$node = $this->app->cfg->upload->storages[$storage] ?? null;
+		$storages = $this->app->cfg->upload->storages;
+		$node = $storages[$storage] ?? null;
 
 		if ($node === null) {
 			throw new UploadConfigException("Storage '{$storage}' is not defined in upload.storages.");
